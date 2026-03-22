@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claudex"
+version = "0.1.0"
+description = "Cross-platform profile manager and session switcher for Claude Code"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "claudex contributors" }]
+keywords = ["claude", "anthropic", "account", "profile", "switcher", "tui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "click>=8.1",
+    "textual>=0.47",
+    "keyring>=24.0",
+    "humanize>=4.0",
+    "rich>=13.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+fuzzy = ["rapidfuzz>=3.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "textual[dev]>=0.47",
+    "mypy>=1.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+claudex = "claudex.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["claudex"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
