@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDE_BIN
+from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDE_BIN, IS_MACOS
 from claudex.exceptions import AuthError, ClaudeNotFoundError
 from claudex.platform import get_credential_backend
 from claudex.platform.base import CredentialBackend
@@ -30,7 +31,12 @@ class AuthStatus:
     @property
     def expires_in_human(self) -> str:
         if self.expires_at is None:
-            return "never" if self.auth_type == "api_key" else "unknown"
+            if self.auth_type == "api_key":
+                return "never"
+            # OAuth via OS keychain (macOS/Windows) — expiry managed by the OS
+            if self.auth_type == "oauth" and not self.raw_token_preview:
+                return "managed by OS"
+            return "unknown"
         now = datetime.now(timezone.utc)
         exp = self.expires_at
         if exp.tzinfo is None:
@@ -201,7 +207,90 @@ class AuthManager:
                     return auth_type, email, expires_at, token
             except Exception:
                 continue
+
+        # On macOS, Claude Code stores the real token in the Keychain under
+        # service "Claude Code-credentials-{sha256(config_dir)[:8]}".
+        # Try that before falling back to metadata-only detection.
+        if IS_MACOS:
+            keychain_data = self._read_macos_keychain(config_dir)
+            if keychain_data:
+                return keychain_data
+
+        # Claude Code also writes state to .claude.json inside the config dir.
+        # If keychain read failed (e.g. user denied access), fall back to
+        # metadata-only: oauthAccount gives us email + billing type so we can
+        # at least show "oauth" instead of "None" in the auth manager.
+        dot_claude = config_dir / ".claude.json"
+        if dot_claude.exists():
+            try:
+                data = json.loads(dot_claude.read_text(encoding="utf-8"))
+                oauth_account = data.get("oauthAccount") or {}
+                if isinstance(oauth_account, dict) and oauth_account.get("accountUuid"):
+                    email = oauth_account.get("emailAddress", "")
+                    billing = oauth_account.get("billingType", "")
+                    auth_type = "api_key" if billing == "api_key" else "oauth"
+                    return auth_type, email, None, ""
+            except Exception:
+                pass
+
         return "none", "", None, ""
+
+    def _read_macos_keychain(
+        self, config_dir: Path
+    ) -> Optional[tuple[str, str, Optional[datetime], str]]:
+        """Read Claude Code's OAuth token from the macOS Keychain.
+
+        Claude Code stores credentials under the service name:
+          "Claude Code-credentials-{sha256(config_dir_path)[:8]}"
+        with the current OS username as the account.
+
+        Falls back to the un-suffixed "Claude Code-credentials" service
+        (used by the default ~/.claude profile).
+        """
+        import getpass
+        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        account = getpass.getuser()
+        services = [
+            f"Claude Code-credentials-{suffix}",
+            "Claude Code-credentials",
+        ]
+        for service in services:
+            try:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    continue
+                raw = result.stdout.strip()
+                data = json.loads(raw)
+
+                oauth_block = data.get("claudeAiOauth") or {}
+                if not isinstance(oauth_block, dict) or not oauth_block.get("accessToken"):
+                    continue
+
+                token: str = oauth_block["accessToken"]
+                refresh: str = oauth_block.get("refreshToken", "")
+                expires_ms = oauth_block.get("expiresAt")
+                expires_at: Optional[datetime] = None
+                if isinstance(expires_ms, (int, float)):
+                    expires_at = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
+                # Email lives in .claude.json → oauthAccount, not in the keychain blob
+                email: str = data.get("emailAddress", "")
+                if not email:
+                    dot_claude = config_dir / ".claude.json"
+                    try:
+                        dc = json.loads(dot_claude.read_text(encoding="utf-8"))
+                        email = (dc.get("oauthAccount") or {}).get("emailAddress", "")
+                    except Exception:
+                        pass
+                auth_type = "oauth" if token.startswith("sk-ant-oat") else "api_key"
+                if refresh:
+                    self.backend.store("_tmp_refresh", "refresh_token", refresh)
+                return auth_type, email, expires_at, token
+            except Exception:
+                continue
+        return None
 
     def _claude_available(self) -> bool:
         import shutil
