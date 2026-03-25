@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDE_BIN, IS_MACOS
+from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDE_BIN, IS_MACOS, IS_WINDOWS
 from claudex.exceptions import AuthError, ClaudeNotFoundError
 from claudex.platform import get_credential_backend
 from claudex.platform.base import CredentialBackend
@@ -208,13 +208,17 @@ class AuthManager:
             except Exception:
                 continue
 
-        # On macOS, Claude Code stores the real token in the Keychain under
-        # service "Claude Code-credentials-{sha256(config_dir)[:8]}".
+        # On macOS/Windows, Claude Code stores the real token in the OS credential
+        # store under "Claude Code-credentials-{sha256(config_dir)[:8]}".
         # Try that before falling back to metadata-only detection.
         if IS_MACOS:
             keychain_data = self._read_macos_keychain(config_dir)
             if keychain_data:
                 return keychain_data
+        elif IS_WINDOWS:
+            wincred_data = self._read_windows_credential_manager(config_dir)
+            if wincred_data:
+                return wincred_data
 
         # Claude Code also writes state to .claude.json inside the config dir.
         # If keychain read failed (e.g. user denied access), fall back to
@@ -290,6 +294,100 @@ class AuthManager:
                 return auth_type, email, expires_at, token
             except Exception:
                 continue
+        return None
+
+    def _read_windows_credential_manager(
+        self, config_dir: Path
+    ) -> Optional[tuple[str, str, Optional[datetime], str]]:
+        """Read Claude Code's OAuth token from the Windows Credential Manager.
+
+        Claude Code (via keytar) stores credentials with a TargetName of:
+          "Claude Code-credentials-{sha256(config_dir)[:8]}/{username}"
+        falling back to the un-suffixed service name for the default profile.
+
+        The CredentialBlob is the JSON payload encoded as UTF-16 LE.
+        """
+        import ctypes
+        import ctypes.wintypes
+        import getpass
+
+        CRED_TYPE_GENERIC = 1
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", ctypes.wintypes.DWORD),
+                        ("dwHighDateTime", ctypes.wintypes.DWORD)]
+
+        class _CREDENTIAL(ctypes.Structure):
+            _fields_ = [
+                ("Flags",              ctypes.wintypes.DWORD),
+                ("Type",               ctypes.wintypes.DWORD),
+                ("TargetName",         ctypes.wintypes.LPWSTR),
+                ("Comment",            ctypes.wintypes.LPWSTR),
+                ("LastWritten",        _FILETIME),
+                ("CredentialBlobSize", ctypes.wintypes.DWORD),
+                ("CredentialBlob",     ctypes.POINTER(ctypes.c_ubyte)),
+                ("Persist",            ctypes.wintypes.DWORD),
+                ("AttributeCount",     ctypes.wintypes.DWORD),
+                ("Attributes",         ctypes.c_void_p),
+                ("TargetAlias",        ctypes.wintypes.LPWSTR),
+                ("UserName",           ctypes.wintypes.LPWSTR),
+            ]
+
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        account = getpass.getuser()
+        # keytar uses "{service}/{account}" as the TargetName; also try bare service
+        targets = [
+            f"Claude Code-credentials-{suffix}/{account}",
+            f"Claude Code-credentials/{account}",
+            f"Claude Code-credentials-{suffix}",
+            "Claude Code-credentials",
+        ]
+        for target in targets:
+            cred_ptr = ctypes.c_void_p(None)
+            ok = advapi32.CredReadW(target, CRED_TYPE_GENERIC, 0, ctypes.byref(cred_ptr))
+            if not ok or not cred_ptr.value:
+                continue
+            try:
+                cred = ctypes.cast(cred_ptr, ctypes.POINTER(_CREDENTIAL)).contents
+                blob_size: int = cred.CredentialBlobSize
+                if blob_size == 0:
+                    continue
+                blob = bytes(
+                    ctypes.cast(cred.CredentialBlob,
+                                ctypes.POINTER(ctypes.c_ubyte * blob_size)).contents
+                )
+                # keytar encodes the value as UTF-16 LE
+                try:
+                    raw = blob.decode("utf-16-le")
+                except UnicodeDecodeError:
+                    raw = blob.decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                oauth_block = data.get("claudeAiOauth") or {}
+                if not isinstance(oauth_block, dict) or not oauth_block.get("accessToken"):
+                    continue
+                token: str = oauth_block["accessToken"]
+                refresh: str = oauth_block.get("refreshToken", "")
+                expires_ms = oauth_block.get("expiresAt")
+                expires_at: Optional[datetime] = None
+                if isinstance(expires_ms, (int, float)):
+                    expires_at = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
+                email: str = data.get("emailAddress", "")
+                if not email:
+                    dot_claude = config_dir / ".claude.json"
+                    try:
+                        dc = json.loads(dot_claude.read_text(encoding="utf-8"))
+                        email = (dc.get("oauthAccount") or {}).get("emailAddress", "")
+                    except Exception:
+                        pass
+                auth_type = "oauth" if token.startswith("sk-ant-oat") else "api_key"
+                if refresh:
+                    self.backend.store("_tmp_refresh", "refresh_token", refresh)
+                return auth_type, email, expires_at, token
+            except Exception:
+                continue
+            finally:
+                advapi32.CredFree(cred_ptr)
         return None
 
     def _claude_available(self) -> bool:
