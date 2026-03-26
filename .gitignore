@@ -26,6 +26,7 @@ htmlcov/
 # Editors
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
