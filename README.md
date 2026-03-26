@@ -21,10 +21,26 @@ Manage multiple Claude Code accounts with full session history, auth management,
 
 ## Install
 
+**One-liner (macOS / Linux):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/codder-cc/claudex/main/install.sh | sh
+```
+
+Installs via pipx (or falls back to pip), then sets up shell integration automatically.
+
+**Manual:**
+
 ```bash
 pip install claudex
 # or
 pipx install claudex
+```
+
+**Windows:**
+
+```powershell
+pip install claudex
 ```
 
 ---
