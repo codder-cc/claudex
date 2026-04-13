@@ -26,6 +26,13 @@ class SessionManager:
     def get_last_session(self, profile_name: str) -> Optional[Session]:
         return self._history.get_last_session(profile_name)
 
+    def find_by_id(self, session_id: str) -> Optional[Session]:
+        """Find a session by ID (or prefix) across all profiles."""
+        for s in self._history.get_all_sessions():
+            if s.session_id == session_id or s.session_id.startswith(session_id):
+                return s
+        return None
+
     def resume(
         self,
         profile_name: str,

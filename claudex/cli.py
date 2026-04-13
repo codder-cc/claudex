@@ -18,11 +18,16 @@ Usage:
   claudex auth add <name>               Fresh OAuth login (opens browser via claude /login)
   claudex auth key <name>               Add a console.anthropic.com API key (sk-ant-api03-...)
   claudex auth status                   Show token type + expiry for all profiles
+  claudex auth refresh <name>           Refresh OAuth access token using refresh token
   claudex auth revoke <name>            Clear stored credentials
 
   -- Sessions --
-  claudex session list [name]           List recent sessions
+  claudex session list                  List recent sessions across ALL profiles
+  claudex session list [name]           Filter sessions by profile
+  claudex session list --full-id        Show full session IDs (for copy-paste)
   claudex session resume [name]         Resume last session for a profile
+  claudex session resume --from <name> -id <id>   Resume specific session by profile + ID
+  claudex session resume -id <id>       Resume any session (auto-detects profile)
   claudex session migrate <id>          Move a session between profiles
 
   -- History --
@@ -457,6 +462,25 @@ def auth_import_current(name: str) -> None:
         sys.exit(1)
 
 
+@auth_group.command("refresh")
+@click.argument("name")
+def auth_refresh(name: str) -> None:
+    """Refresh the OAuth access token for a profile using its stored refresh token."""
+    try:
+        pm = _pm()
+        am = _auth()
+        profile = pm.get(name)
+        console.print(f"[cyan]Refreshing token for profile [bold]{name}[/bold]...[/cyan]")
+        status = am.refresh(name, profile.config_dir)
+        console.print(f"[green]✓[/green] Token refreshed for '{name}'")
+        console.print(f"  Expires: {status.expires_in_human}")
+        if status.email:
+            console.print(f"  Email:   {status.email}")
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
 @auth_group.command("revoke")
 @click.argument("name")
 @click.confirmation_option(prompt="Revoke auth credentials for this profile?")
@@ -476,51 +500,96 @@ def session_group() -> None:
 @session_group.command("list")
 @click.argument("name", required=False)
 @click.option("--limit", "-n", default=20, help="Number of sessions to show")
-def session_list(name: Optional[str], limit: int) -> None:
-    """List sessions for a profile (or all profiles)."""
+@click.option("--full-id", is_flag=True, help="Show full session IDs (for use with --resume)")
+def session_list(name: Optional[str], limit: int, full_id: bool) -> None:
+    """List sessions across all profiles (or filter by profile name)."""
     pm = _pm()
     profiles = [pm.get(name)] if name else pm.list()
     from claudex.history.browser import HistoryBrowser
     browser = HistoryBrowser(profiles)
     sessions = browser.get_all_sessions(profile_filter=name, limit=limit)
     if not sessions:
-        console.print("[yellow]No sessions found.[/yellow]")
+        target = f"profile '{name}'" if name else "any profile"
+        console.print(f"[yellow]No sessions found in {target}.[/yellow]")
         return
-    table = Table(title="Sessions", header_style="bold cyan")
+    title = f"Sessions — {name}" if name else "Sessions — all profiles"
+    table = Table(title=title, header_style="bold cyan")
     table.add_column("Profile", style="bold")
     table.add_column("Last Active")
     table.add_column("Title")
     table.add_column("Msgs")
     table.add_column("Tokens")
-    table.add_column("Session ID")
+    table.add_column("Session ID", style="dim")
     for s in sessions:
+        sid = s.session_id if full_id else s.session_id[:16] + "..."
         table.add_row(
-            s.profile_name, s.age_human, s.title[:60],
-            str(s.message_count), f"{s.total_tokens.total:,}", s.session_id[:16] + "...",
+            s.profile_name, s.age_human, s.title[:55],
+            str(s.message_count), f"{s.total_tokens.total:,}", sid,
         )
     console.print(table)
+    if not full_id:
+        console.print("[dim]Tip: use --full-id to show complete session IDs for resuming[/dim]")
+    console.print(f"[dim]Resume any session: claudex session resume --session-id <id>[/dim]")
 
 
 @session_group.command("resume")
 @click.argument("name", required=False)
-@click.option("--session-id", "-s", default=None, help="Specific session ID to resume")
-@click.option("--strategy", default="env", type=click.Choice(["env", "direct", "continue"]))
-def session_resume(name: Optional[str], session_id: Optional[str], strategy: str) -> None:
-    """Resume the last session for a profile."""
+@click.option("--from", "from_profile", default=None, help="Profile that owns the session (alias for the positional name)")
+@click.option("--session-id", "-s", "-id", default=None, help="Session ID to resume (auto-detects profile if --from is omitted)")
+@click.option("--strategy", default="direct", type=click.Choice(["env", "direct", "continue"]),
+              help="Resume strategy: direct=--resume <id>, env=set CLAUDE_CONFIG_DIR only, continue=--continue")
+def session_resume(name: Optional[str], from_profile: Optional[str], session_id: Optional[str], strategy: str) -> None:
+    """Resume a session for a profile.
+
+    \b
+    Examples:
+      claudex session resume                          # resume last session (active profile)
+      claudex session resume work                     # resume last session for 'work'
+      claudex session resume --from work -id <id>    # resume specific session from 'work'
+      claudex session resume -id <id>                # auto-detect profile from session ID
+    """
     try:
         pm = _pm()
         am = _auth()
-        # Determine profile
+        from claudex.history.browser import HistoryBrowser
+        from claudex.core.session import SessionManager
+        browser = HistoryBrowser(pm.list())
+        sm = SessionManager(am, browser)
+
+        # --from takes precedence over positional name
+        name = from_profile or name
+
+        # Cross-profile lookup: session-id given but no profile specified
+        if session_id and not name:
+            session = sm.find_by_id(session_id)
+            if not session:
+                console.print(f"[red]Session '{session_id}' not found in any profile.[/red]")
+                console.print("  Use [cyan]claudex session list[/cyan] to browse sessions.")
+                sys.exit(1)
+            name = session.profile_name
+            session_id = session.session_id  # Use full ID
+            console.print(f"[dim]Found session in profile [bold]{name}[/bold][/dim]")
+
+        # Fall back to active profile
         if not name:
             name = pm.get_active()
             if not name:
-                console.print("[red]No active profile. Run 'claudex switch <name>' first.[/red]")
+                console.print("[red]No active profile. Run 'claudex switch <name>' or pass a profile name.[/red]")
                 sys.exit(1)
+
         profile = pm.get(name)
-        from claudex.history.browser import HistoryBrowser
-        browser = HistoryBrowser(pm.list())
-        from claudex.core.session import SessionManager
-        sm = SessionManager(am, browser)
+
+        # Auto-refresh expired OAuth token if a refresh token is available
+        status = am.get_status(name, profile.config_dir)
+        if status.is_expired and status.refresh_available:
+            console.print(f"[yellow]Token expired — refreshing automatically...[/yellow]")
+            try:
+                am.refresh(name, profile.config_dir)
+                console.print(f"[green]✓[/green] Token refreshed.")
+            except ClaudexError as e:
+                console.print(f"[yellow]Warning: token refresh failed: {e}[/yellow]")
+                console.print("  Continuing anyway — Claude may prompt for re-auth.")
+
         console.print(f"[cyan]Resuming session for profile [bold]{name}[/bold]...[/cyan]")
         sm.resume(name, profile.config_dir, session_id=session_id, strategy=strategy)
     except ClaudexError as e:

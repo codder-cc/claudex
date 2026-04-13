@@ -136,9 +136,161 @@ class AuthManager:
         # works by Claude reading .credentials.json from CLAUDE_CONFIG_DIR directly.
         return env
 
+    def refresh(self, profile_name: str, config_dir: Path) -> AuthStatus:
+        """Use the stored refresh token to obtain a new access token.
+
+        Calls the Claude OAuth token endpoint and persists the new tokens to
+        both our credential backend and the profile's .credentials.json so
+        Claude Code picks them up on next launch.
+
+        Raises AuthError if no refresh token is stored or the refresh fails.
+        """
+        import urllib.request
+        import urllib.error
+
+        refresh_token = self.backend.retrieve(profile_name, "refresh_token")
+        if not refresh_token:
+            # Fall back: try reading directly from Claude's credential files
+            self._import_claude_credentials(profile_name, config_dir)
+            refresh_token = self.backend.retrieve(profile_name, "refresh_token")
+        if not refresh_token:
+            raise AuthError(
+                f"No refresh token stored for profile '{profile_name}'. "
+                "Run 'claudex auth add' or 'claudex auth import-current' first."
+            )
+
+        payload = json.dumps({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://platform.claude.com/v1/oauth/token",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            raise AuthError(f"Token refresh failed ({e.code}): {body}") from e
+        except Exception as e:
+            raise AuthError(f"Token refresh request failed: {e}") from e
+
+        access_token: str = data.get("access_token", "")
+        new_refresh: str = data.get("refresh_token", refresh_token)  # keep old if not rotated
+        expires_in: int = data.get("expires_in", 0)
+        if not access_token:
+            raise AuthError("Token refresh response missing access_token")
+
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        expires_at_ms = now_ms + (expires_in * 1000) if expires_in else None
+        expires_at: Optional[datetime] = None
+        if expires_at_ms:
+            expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
+
+        # Extract email from response if present
+        account = data.get("account") or {}
+        email = account.get("email_address", "") or self.backend.retrieve(profile_name, "email") or ""
+
+        # Persist to our backend
+        self.backend.store(profile_name, "oauth_token", access_token)
+        self.backend.store(profile_name, "refresh_token", new_refresh)
+        self.backend.store(profile_name, "auth_type", "oauth")
+        if email:
+            self.backend.store(profile_name, "email", email)
+        if expires_at:
+            self.backend.store(profile_name, "expires_at", expires_at.isoformat())
+
+        # Write back to .credentials.json so Claude Code picks up the new token
+        self._write_credentials_file(config_dir, access_token, new_refresh, expires_at_ms)
+
+        # On macOS, also update the Keychain entry so Claude reads the fresh token
+        if IS_MACOS:
+            self._write_macos_keychain(config_dir, access_token, new_refresh, expires_at_ms)
+
+        return self.get_status(profile_name, config_dir)
+
     def revoke(self, profile_name: str) -> None:
         for key in ["oauth_token", "refresh_token", "api_key", "auth_type", "email", "expires_at"]:
             self.backend.delete(profile_name, key)
+
+    def _write_credentials_file(
+        self,
+        config_dir: Path,
+        access_token: str,
+        refresh_token: str,
+        expires_at_ms: Optional[float],
+    ) -> None:
+        """Write/merge refreshed tokens into .credentials.json in the profile dir."""
+        cred_file = config_dir / ".credentials.json"
+        existing: dict = {}
+        if cred_file.exists():
+            try:
+                existing = json.loads(cred_file.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+
+        oauth_block = existing.get("claudeAiOauth") or {}
+        oauth_block["accessToken"] = access_token
+        oauth_block["refreshToken"] = refresh_token
+        if expires_at_ms is not None:
+            oauth_block["expiresAt"] = int(expires_at_ms)
+        existing["claudeAiOauth"] = oauth_block
+
+        cred_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        # Restrict to owner-only (same as Claude Code does)
+        try:
+            cred_file.chmod(0o600)
+        except Exception:
+            pass
+
+    def _write_macos_keychain(
+        self,
+        config_dir: Path,
+        access_token: str,
+        refresh_token: str,
+        expires_at_ms: Optional[float],
+    ) -> None:
+        """Update the macOS Keychain entry Claude Code uses for this profile."""
+        import getpass
+        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        account = getpass.getuser()
+        service = f"Claude Code-credentials-{suffix}"
+
+        # Read current keychain blob so we can merge (preserves other fields)
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            existing: dict = json.loads(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else {}
+        except Exception:
+            existing = {}
+
+        oauth_block = existing.get("claudeAiOauth") or {}
+        oauth_block["accessToken"] = access_token
+        oauth_block["refreshToken"] = refresh_token
+        if expires_at_ms is not None:
+            oauth_block["expiresAt"] = int(expires_at_ms)
+        existing["claudeAiOauth"] = oauth_block
+
+        blob = json.dumps(existing)
+        try:
+            subprocess.run(
+                ["security", "add-generic-password",
+                 "-s", service, "-a", account, "-w", blob, "-U"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass  # Non-fatal: .credentials.json is the primary fallback
 
     def _import_claude_credentials(self, profile_name: str, config_dir: Path) -> None:
         """Read credentials Claude wrote during /login and store them in our backend."""
