@@ -979,16 +979,44 @@ def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[st
         console.print(f"[red]Failed to extract bundle:[/red] {e}")
         sys.exit(1)
 
-    # Import credentials from the extracted .credentials.json into the local
-    # credential backend (keyring) and OS Keychain (macOS) so Claude Code and
-    # `claudex auth status` both work without a manual re-login.
+    # Fix profile.toml: the bundle contains the source profile's name — overwrite
+    # it with the requested new name so `claudex list` / `auth status` show correctly.
+    profile_toml = target_config_dir / "profile.toml"
+    if profile_toml.exists():
+        try:
+            import tomllib as _tomllib
+        except ImportError:
+            import tomli as _tomllib  # type: ignore
+        import tomli_w as _tomli_w  # type: ignore[import]
+        try:
+            data = _tomllib.loads(profile_toml.read_text(encoding="utf-8"))
+            data["name"] = new_profile_name
+            profile_toml.write_text(_tomli_w.dumps(data), encoding="utf-8")
+        except Exception:
+            # tomli_w may not be installed; fall back to simple line replace
+            text = profile_toml.read_text(encoding="utf-8")
+            import re as _re
+            text = _re.sub(r'^name\s*=\s*"[^"]*"', f'name = "{new_profile_name}"', text, flags=_re.MULTILINE)
+            profile_toml.write_text(text, encoding="utf-8")
+
+    # Import credentials from .credentials.json into local keyring + macOS Keychain.
     from claudex.core.auth import AuthManager
     auth_mgr = AuthManager()
     imported = auth_mgr.import_credentials_from_file(new_profile_name, target_config_dir)
     if imported:
         console.print("[dim]Credentials imported into local keyring (accessToken + refreshToken)[/dim]")
+        # Try to refresh immediately if the access token is already expired
+        try:
+            status = auth_mgr.get_status(new_profile_name, target_config_dir)
+            if status.is_expired and status.refresh_available:
+                console.print("[cyan]Access token expired — refreshing automatically...[/cyan]")
+                auth_mgr.refresh_token(new_profile_name, target_config_dir)
+                console.print("[dim]Token refreshed.[/dim]")
+        except Exception as refresh_err:
+            console.print(f"[yellow]Token refresh failed:[/yellow] {refresh_err}")
+            console.print(f"  Run: [cyan]claudex auth add {new_profile_name}[/cyan]")
     else:
-        console.print("[yellow]Note:[/yellow] No credentials found in bundle. Run `claudex auth add` to authenticate.")
+        console.print(f"[yellow]No credentials in bundle.[/yellow] Run: [cyan]claudex auth add {new_profile_name}[/cyan]")
 
     console.print()
     console.print(f"[green]✓[/green] Profile [bold]{new_profile_name}[/bold] restored!")
