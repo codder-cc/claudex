@@ -41,7 +41,7 @@ Usage:
   -- Profile Sharing --
   claudex share auth [--endpoint URL]           Log in to a sharing server
   claudex share push <profile> [--label TEXT]   Encrypt and upload profile; prints share token
-  claudex share pull <token> <new-name> [--endpoint URL]  Download and decrypt a shared profile
+  claudex share pull <label> <new-name> [--endpoint URL]  Pull by label (no token needed if logged in)
   claudex share list [--endpoint URL]           List your shares on the server
   claudex share revoke <token-id> [--endpoint URL]  Revoke a share
 
@@ -863,9 +863,12 @@ def share_push(profile_name: str, label: Optional[str], expires_days: Optional[i
         console.print(f"[red]Failed to create bundle:[/red] {e}")
         sys.exit(1)
 
+    # Generate key + encrypt bundle, build cx_ token — all client-side before upload.
+    # The token embeds the AES key which never touches the server.
     aes_key = generate_key()
     ciphertext = encrypt(aes_key, bundle_bytes)
     ciphertext_b64 = base64.b64encode(ciphertext).decode("ascii")
+    share_token = encode_share_token(aes_key)  # builds token with a fresh UUID inside
 
     try:
         client = load_client(ep)
@@ -875,30 +878,28 @@ def share_push(profile_name: str, label: Optional[str], expires_days: Optional[i
 
     console.print(f"[cyan]Uploading encrypted bundle to[/cyan] {ep}...")
     try:
-        token_id = client.create_share(label, ciphertext_b64, expires_days)
+        token_id = client.create_share(label, ciphertext_b64, share_token, expires_days)
     except SharingAPIError as e:
         console.print(f"[red]Upload failed:[/red] {e.message}")
         sys.exit(1)
-
-    share_token = encode_share_token(token_id, aes_key)
     console.print()
-    console.print(f"[green]✓[/green] Profile [bold]{profile_name}[/bold] shared successfully!")
-    console.print()
-    console.print(f"[bold]Share token:[/bold]")
-    console.print(f"[cyan]{share_token}[/cyan]")
+    console.print(f"[green]✓[/green] Profile [bold]{profile_name}[/bold] shared as [bold]\"{label}\"[/bold]")
     console.print()
     console.print("On another machine, run:")
-    console.print(f"[cyan]claudex share pull {share_token} PROFILE_NAME[/cyan]")
+    console.print(f"[cyan]claudex share pull \"{label}\" PROFILE_NAME[/cyan]")
     console.print()
-    console.print("[dim]Keep this token secret — it contains the decryption key.[/dim]")
+    console.print("[dim]That's it — no token needed if you're logged in to the same account.[/dim]")
 
 
 @share_group.command("pull")
-@click.argument("share_token")
+@click.argument("label_or_token")
 @click.argument("new_profile_name")
 @click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
-def share_pull(share_token: str, new_profile_name: str, endpoint: Optional[str]) -> None:
+def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[str]) -> None:
     """Download and decrypt a shared profile.
+
+    LABEL_OR_TOKEN can be the share label (e.g. "work") or a cx_ token.
+    If you're logged in to the same account on this machine, just use the label.
 
     Creates a new profile called NEW_PROFILE_NAME with the downloaded config.
     """
@@ -909,12 +910,8 @@ def share_pull(share_token: str, new_profile_name: str, endpoint: Optional[str])
     from claudex.core.sharing_client import load_client, SharingAPIError
     import base64
 
-    share_token = share_token.strip()
-    try:
-        token_id, aes_key = decode_share_token(share_token)
-    except ValueError as e:
-        console.print(f"[red]Invalid share token:[/red] {e}")
-        sys.exit(1)
+    label_or_token = label_or_token.strip()
+    is_token = label_or_token.startswith("cx_")
 
     try:
         client = load_client(ep)
@@ -923,11 +920,37 @@ def share_pull(share_token: str, new_profile_name: str, endpoint: Optional[str])
         sys.exit(1)
 
     console.print(f"[cyan]Fetching encrypted bundle from[/cyan] {ep}...")
-    try:
-        ciphertext_b64 = client.get_share(token_id)
-    except SharingAPIError as e:
-        console.print(f"[red]Download failed:[/red] {e.message}")
-        sys.exit(1)
+
+    if is_token:
+        # Explicit cx_ token provided — decode key from it, fetch by token_id
+        try:
+            token_id, aes_key = decode_share_token(label_or_token)
+        except ValueError as e:
+            console.print(f"[red]Invalid share token:[/red] {e}")
+            sys.exit(1)
+        try:
+            ciphertext_b64 = client.get_share(token_id)
+        except SharingAPIError as e:
+            console.print(f"[red]Download failed:[/red] {e.message}")
+            sys.exit(1)
+    else:
+        # Pull by label — server returns both ciphertext and stored cx_ token
+        try:
+            resp = client.get_share_by_label(label_or_token)
+        except SharingAPIError as e:
+            console.print(f"[red]Download failed:[/red] {e.message}")
+            sys.exit(1)
+        stored_token = resp.get("share_token", "")
+        if not stored_token:
+            console.print("[red]Server has no token stored for this share.[/red]")
+            console.print("[dim]Re-push the profile with a newer claudex to enable pull-by-label.[/dim]")
+            sys.exit(1)
+        try:
+            _, aes_key = decode_share_token(stored_token)
+        except ValueError as e:
+            console.print(f"[red]Stored token is invalid:[/red] {e}")
+            sys.exit(1)
+        ciphertext_b64 = resp["encrypted_data"]
 
     try:
         ciphertext = base64.b64decode(ciphertext_b64)

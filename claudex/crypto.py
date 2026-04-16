@@ -54,13 +54,14 @@ def decrypt(key: bytes, blob: bytes) -> bytes:
         raise ValueError("Decryption failed — wrong key or corrupted data")
 
 
-def encode_share_token(token_id: str, key: bytes) -> str:
-    """Combine a UUID token_id and AES key into a portable share token string.
+def encode_share_token(key: bytes) -> str:
+    """Build a share token embedding a fresh UUID and the AES key.
 
     Format: ``cx_<base64url(uuid_bytes + aes_key)>``
     The result is 67 characters: 3 prefix + 64 base64url chars (48 raw bytes).
+    The UUID embedded in the token becomes the server-side ``token_id``.
     """
-    uid_bytes = uuid.UUID(token_id).bytes  # 16 bytes
+    uid_bytes = uuid.uuid4().bytes         # 16 bytes, fresh each call
     raw = uid_bytes + key                  # 48 bytes total
     b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     return "cx_" + b64

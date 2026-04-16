@@ -119,6 +119,7 @@ class SharingClient:
         self,
         label: str,
         encrypted_data_b64: str,
+        share_token: str,
         expires_in_days: Optional[int] = None,
     ) -> str:
         """Upload an encrypted profile bundle.
@@ -128,6 +129,7 @@ class SharingClient:
         payload: Dict[str, Any] = {
             "label": label,
             "encrypted_data": encrypted_data_b64,
+            "share_token": share_token,
         }
         if expires_in_days and expires_in_days > 0:
             payload["expires_in_days"] = expires_in_days
@@ -151,6 +153,19 @@ class SharingClient:
             headers=self._auth_header,
         )
         return result["encrypted_data"]
+
+    def get_share_by_label(self, label: str) -> dict:
+        """Download an encrypted profile bundle by label (no cx_ token needed).
+
+        Returns the full response dict including ``encrypted_data`` and ``share_token``.
+        """
+        from urllib.parse import quote
+        result = _http(
+            "GET",
+            self._url(f"/api/v1/claudex/shares/by-label/{quote(label, safe='')}"),
+            headers=self._auth_header,
+        )
+        return result
 
     def list_shares(self) -> List[dict]:
         """Return a list of share metadata dicts for the authenticated user."""
