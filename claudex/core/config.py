@@ -50,6 +50,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "auto_switch": True,      # .claudeprofile file detection
     "resume_strategy": "env", # env | direct (--resume flag)
     "tui_refresh_seconds": 5,
+    "sharing_endpoint": "",   # URL of a claudex-sharing server (e.g. https://codder.cc)
 }
 
 
@@ -101,6 +102,14 @@ class GlobalConfig:
     @property
     def resume_strategy(self) -> str:
         return self.get("resume_strategy", "env")
+
+    @property
+    def sharing_endpoint(self) -> str:
+        return self.get("sharing_endpoint", "")
+
+    @sharing_endpoint.setter
+    def sharing_endpoint(self, url: str) -> None:
+        self.set("sharing_endpoint", url.rstrip("/"))
 
 
 def load_config() -> GlobalConfig:

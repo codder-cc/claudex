@@ -38,6 +38,20 @@ Usage:
   claudex shell setup                   Install shell aliases + auto-switch hook
   claudex shell hook                    Print shell snippet (for manual inclusion)
 
+  -- Profile Sharing --
+  claudex share auth [--endpoint URL]           Log in to a sharing server
+  claudex share push <profile> [--label TEXT]   Encrypt and upload profile; prints share token
+  claudex share pull <token> <new-name> [--endpoint URL]  Download and decrypt a shared profile
+  claudex share list [--endpoint URL]           List your shares on the server
+  claudex share revoke <token-id> [--endpoint URL]  Revoke a share
+
+  -- MCP --
+  claudex mcp setup <profile> [--endpoint URL]  Register sharing MCP server in a profile
+
+  -- Config --
+  claudex config set sharing.endpoint <url>     Set default sharing endpoint
+  claudex config get sharing.endpoint           Show current sharing endpoint
+
   -- Other --
   claudex doctor                        Diagnose installation issues
   claudex export <name>                 Export profile to .tar.gz
@@ -721,6 +735,363 @@ def internal_write_env(profile_name: str) -> None:
         sys.exit(0)
     except ClaudexError:
         sys.exit(1)
+
+
+# ─── Config commands ──────────────────────────────────────────────────────────
+
+@cli.group("config")
+def config_group() -> None:
+    """Manage claudex global configuration."""
+
+
+@config_group.command("set")
+@click.argument("key")
+@click.argument("value")
+def config_set(key: str, value: str) -> None:
+    """Set a configuration value (e.g. sharing.endpoint https://codder.cc)."""
+    cfg = load_config()
+    if key == "sharing.endpoint":
+        cfg.sharing_endpoint = value
+        cfg.save()
+        console.print(f"[green]✓[/green] sharing.endpoint = {value}")
+    else:
+        console.print(f"[red]Unknown config key:[/red] {key}")
+        sys.exit(1)
+
+
+@config_group.command("get")
+@click.argument("key")
+def config_get(key: str) -> None:
+    """Get a configuration value."""
+    cfg = load_config()
+    if key == "sharing.endpoint":
+        val = cfg.sharing_endpoint or "(not set)"
+        console.print(f"sharing.endpoint = {val}")
+    else:
+        console.print(f"[red]Unknown config key:[/red] {key}")
+        sys.exit(1)
+
+
+# ─── Share commands ────────────────────────────────────────────────────────────
+
+def _resolve_endpoint(endpoint_flag: Optional[str]) -> str:
+    """Resolve sharing endpoint: flag > config > error."""
+    if endpoint_flag:
+        return endpoint_flag.rstrip("/")
+    cfg = load_config()
+    ep = cfg.sharing_endpoint
+    if ep:
+        return ep
+    console.print(
+        "[red]No sharing endpoint configured.[/red]\n"
+        "  Run: [cyan]claudex config set sharing.endpoint <url>[/cyan]\n"
+        "  Or pass [cyan]--endpoint <url>[/cyan] to this command."
+    )
+    sys.exit(1)
+
+
+@cli.group("share")
+def share_group() -> None:
+    """Cross-machine encrypted profile sharing."""
+
+
+@share_group.command("auth")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+def share_auth(endpoint: Optional[str]) -> None:
+    """Authenticate to a profile sharing server and save credentials."""
+    ep = _resolve_endpoint(endpoint)
+    console.print(f"[cyan]Logging in to:[/cyan] {ep}")
+    username = click.prompt("Username")
+    password = click.prompt("Password", hide_input=True)
+
+    from claudex.core.sharing_client import login, SharingAPIError
+    try:
+        login(ep, username, password)
+        console.print(f"[green]✓[/green] Authenticated to {ep}")
+    except SharingAPIError as e:
+        console.print(f"[red]Login failed:[/red] {e.message}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+@share_group.command("push")
+@click.argument("profile_name")
+@click.option("--label", "-l", default=None, help="Human-readable label for this share")
+@click.option("--expires-days", default=None, type=int, help="Expiry in days (default: no expiry)")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+def share_push(profile_name: str, label: Optional[str], expires_days: Optional[int],
+               endpoint: Optional[str]) -> None:
+    """Encrypt and upload a profile config to the sharing server.
+
+    Prints the share token — copy it to use on another machine with `claudex share pull`.
+    Session history is NOT included. Credentials ARE included (encrypted).
+    """
+    ep = _resolve_endpoint(endpoint)
+    pm = _pm()
+
+    try:
+        profile = pm.get(profile_name)
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if label is None:
+        label = f"{profile_name} — {profile.email or 'unknown'}"
+
+    console.print(f"[cyan]Bundling profile[/cyan] [bold]{profile_name}[/bold]...")
+
+    from claudex.core.profile_bundle import export_bundle
+    from claudex.crypto import generate_key, encrypt, encode_share_token
+    from claudex.core.sharing_client import load_client, SharingAPIError
+    import base64
+
+    try:
+        bundle_bytes = export_bundle(profile.config_dir)
+    except Exception as e:
+        console.print(f"[red]Failed to create bundle:[/red] {e}")
+        sys.exit(1)
+
+    aes_key = generate_key()
+    ciphertext = encrypt(aes_key, bundle_bytes)
+    ciphertext_b64 = base64.b64encode(ciphertext).decode("ascii")
+
+    try:
+        client = load_client(ep)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    console.print(f"[cyan]Uploading encrypted bundle to[/cyan] {ep}...")
+    try:
+        token_id = client.create_share(label, ciphertext_b64, expires_days)
+    except SharingAPIError as e:
+        console.print(f"[red]Upload failed:[/red] {e.message}")
+        sys.exit(1)
+
+    share_token = encode_share_token(token_id, aes_key)
+    console.print()
+    console.print(f"[green]✓[/green] Profile [bold]{profile_name}[/bold] shared successfully!")
+    console.print()
+    console.print(f"[bold]Share token:[/bold]")
+    console.print(f"  [cyan]{share_token}[/cyan]")
+    console.print()
+    console.print("On another machine, run:")
+    console.print(f"  [cyan]claudex share pull {share_token} <new-profile-name>[/cyan]")
+    console.print()
+    console.print("[dim]Keep this token secret — it contains the decryption key.[/dim]")
+
+
+@share_group.command("pull")
+@click.argument("share_token")
+@click.argument("new_profile_name")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+def share_pull(share_token: str, new_profile_name: str, endpoint: Optional[str]) -> None:
+    """Download and decrypt a shared profile.
+
+    Creates a new profile called NEW_PROFILE_NAME with the downloaded config.
+    """
+    ep = _resolve_endpoint(endpoint)
+
+    from claudex.crypto import decode_share_token, decrypt
+    from claudex.core.profile_bundle import import_bundle
+    from claudex.core.sharing_client import load_client, SharingAPIError
+    import base64
+
+    try:
+        token_id, aes_key = decode_share_token(share_token)
+    except ValueError as e:
+        console.print(f"[red]Invalid share token:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        client = load_client(ep)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    console.print(f"[cyan]Fetching encrypted bundle from[/cyan] {ep}...")
+    try:
+        ciphertext_b64 = client.get_share(token_id)
+    except SharingAPIError as e:
+        console.print(f"[red]Download failed:[/red] {e.message}")
+        sys.exit(1)
+
+    try:
+        ciphertext = base64.b64decode(ciphertext_b64)
+        bundle_bytes = decrypt(aes_key, ciphertext)
+    except ValueError as e:
+        console.print(f"[red]Decryption failed:[/red] {e}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error decrypting bundle:[/red] {e}")
+        sys.exit(1)
+
+    pm = _pm()
+    try:
+        existing = pm.get(new_profile_name)
+        console.print(f"[yellow]Profile '{new_profile_name}' already exists — overwriting config files.[/yellow]")
+        target_config_dir = existing.config_dir
+    except ClaudexError:
+        profile = pm.create(new_profile_name)
+        target_config_dir = profile.config_dir
+
+    console.print(f"[cyan]Extracting profile to[/cyan] {target_config_dir}...")
+    try:
+        import_bundle(bundle_bytes, target_config_dir)
+    except Exception as e:
+        console.print(f"[red]Failed to extract bundle:[/red] {e}")
+        sys.exit(1)
+
+    console.print()
+    console.print(f"[green]✓[/green] Profile [bold]{new_profile_name}[/bold] restored!")
+    console.print()
+    console.print("Verify credentials:")
+    console.print(f"  [cyan]claudex auth status {new_profile_name}[/cyan]")
+    console.print()
+    console.print("Launch with this profile:")
+    console.print(f"  [cyan]claudex use {new_profile_name}[/cyan]")
+
+
+@share_group.command("list")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+def share_list(endpoint: Optional[str]) -> None:
+    """List your profile shares on the sharing server."""
+    ep = _resolve_endpoint(endpoint)
+
+    from claudex.core.sharing_client import load_client, SharingAPIError
+    try:
+        client = load_client(ep)
+        shares = client.list_shares()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    except SharingAPIError as e:
+        console.print(f"[red]API error:[/red] {e.message}")
+        sys.exit(1)
+
+    if not shares:
+        console.print("[yellow]No shares found.[/yellow]")
+        return
+
+    table = Table(title=f"Shares on {ep}", header_style="bold cyan")
+    table.add_column("Token ID (partial)", style="dim")
+    table.add_column("Label")
+    table.add_column("Status")
+    table.add_column("Accesses", justify="right")
+    table.add_column("Created")
+    table.add_column("Expires")
+
+    for s in shares:
+        token_id = s.get("token_id", "")
+        label = s.get("label", "—")
+        is_revoked = s.get("is_revoked", False)
+        status = "[red]revoked[/red]" if is_revoked else "[green]active[/green]"
+        accesses = str(s.get("access_count", 0))
+        created = (s.get("created_at") or "—")[:10]
+        expires = (s.get("expires_at") or "never")[:10]
+        table.add_row(token_id[:18] + "...", label, status, accesses, created, expires)
+
+    console.print(table)
+
+
+@share_group.command("revoke")
+@click.argument("token_id")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def share_revoke(token_id: str, endpoint: Optional[str], yes: bool) -> None:
+    """Revoke a share by its server-side token ID."""
+    ep = _resolve_endpoint(endpoint)
+
+    if not yes:
+        click.confirm(
+            f"Revoke share '{token_id[:18]}...'? This cannot be undone.",
+            abort=True,
+        )
+
+    from claudex.core.sharing_client import load_client, SharingAPIError
+    try:
+        client = load_client(ep)
+        client.revoke_share(token_id)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    except SharingAPIError as e:
+        console.print(f"[red]Revoke failed:[/red] {e.message}")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Share revoked.")
+
+
+# ─── MCP commands ─────────────────────────────────────────────────────────────
+
+@cli.group("mcp")
+def mcp_group() -> None:
+    """MCP server management for Claude Code integration."""
+
+
+@mcp_group.command("setup")
+@click.argument("profile_name")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+@click.option("--name", "server_name", default="claudex-sharing",
+              help="MCP server name in mcp_servers.json (default: claudex-sharing)")
+def mcp_setup(profile_name: str, endpoint: Optional[str], server_name: str) -> None:
+    """Register the claudex sharing MCP server in a profile's mcp_servers.json.
+
+    After running this, start a Claude Code session with the profile and you can
+    use the share_profile, pull_profile, list_profiles, and revoke_profile tools
+    directly in a Claude conversation.
+    """
+    import json as _json
+
+    ep = _resolve_endpoint(endpoint)
+    pm = _pm()
+
+    try:
+        profile = pm.get(profile_name)
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    # Load JWT from credential backend
+    from claudex.core.sharing_client import SharingCredentials
+    creds = SharingCredentials(ep)
+    jwt = creds.load_jwt()
+    if not jwt:
+        console.print(
+            f"[red]No credentials for {ep}.[/red]\n"
+            "  Run: [cyan]claudex share auth --endpoint <url>[/cyan]"
+        )
+        sys.exit(1)
+
+    mcp_path = profile.config_dir / "mcp_servers.json"
+    if mcp_path.exists():
+        try:
+            mcp_config = _json.loads(mcp_path.read_text(encoding="utf-8"))
+        except Exception:
+            mcp_config = {}
+    else:
+        mcp_config = {}
+
+    mcp_url = ep + "/api/v1/claudex/mcp"
+    mcp_config[server_name] = {
+        "type": "sse",
+        "url": mcp_url,
+        "headers": {
+            "Authorization": f"Bearer {jwt}",
+        },
+    }
+    mcp_path.write_text(_json.dumps(mcp_config, indent=2) + "\n", encoding="utf-8")
+
+    console.print(f"[green]✓[/green] MCP server [bold]{server_name}[/bold] registered in profile [bold]{profile_name}[/bold]")
+    console.print(f"  URL: {mcp_url}")
+    console.print()
+    console.print("Start a Claude Code session:")
+    console.print(f"  [cyan]claudex use {profile_name}[/cyan]")
+    console.print()
+    console.print("Then use these MCP tools in your Claude conversation:")
+    console.print("  [dim]share_profile[/dim], [dim]pull_profile[/dim], [dim]list_profiles[/dim], [dim]revoke_profile[/dim]")
 
 
 if __name__ == "__main__":
