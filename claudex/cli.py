@@ -374,11 +374,12 @@ def auth_key(name: str, key: str) -> None:
 
 
 @auth_group.command("status")
-def auth_status() -> None:
-    """Show auth status for all profiles."""
+@click.argument("profile_name", required=False, default=None)
+def auth_status(profile_name: Optional[str]) -> None:
+    """Show auth status for all profiles, or a specific one."""
     pm = _pm()
     am = _auth()
-    profiles = pm.list()
+    profiles = [pm.get(profile_name)] if profile_name else pm.list()
     if not profiles:
         console.print("[yellow]No profiles found.[/yellow]")
         return
@@ -993,7 +994,7 @@ def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[st
     console.print(f"[green]✓[/green] Profile [bold]{new_profile_name}[/bold] restored!")
     console.print()
     console.print("Verify credentials:")
-    console.print(f"  [cyan]claudex auth status {new_profile_name}[/cyan]")
+    console.print(f"  [cyan]claudex auth status[/cyan]")
     console.print()
     console.print("Launch with this profile:")
     console.print(f"  [cyan]claudex use {new_profile_name}[/cyan]")
