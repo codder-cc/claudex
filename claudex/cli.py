@@ -885,10 +885,10 @@ def share_push(profile_name: str, label: Optional[str], expires_days: Optional[i
     console.print(f"[green]✓[/green] Profile [bold]{profile_name}[/bold] shared successfully!")
     console.print()
     console.print(f"[bold]Share token:[/bold]")
-    console.print(f"  [cyan]{share_token}[/cyan]")
+    console.print(f"[cyan]{share_token}[/cyan]")
     console.print()
     console.print("On another machine, run:")
-    console.print(f"  [cyan]claudex share pull {share_token} <new-profile-name>[/cyan]")
+    console.print(f"[cyan]claudex share pull {share_token} PROFILE_NAME[/cyan]")
     console.print()
     console.print("[dim]Keep this token secret — it contains the decryption key.[/dim]")
 
@@ -909,6 +909,7 @@ def share_pull(share_token: str, new_profile_name: str, endpoint: Optional[str])
     from claudex.core.sharing_client import load_client, SharingAPIError
     import base64
 
+    share_token = share_token.strip()
     try:
         token_id, aes_key = decode_share_token(share_token)
     except ValueError as e:
