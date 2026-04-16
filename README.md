@@ -10,12 +10,16 @@ Manage multiple Claude Code accounts with full session history, auth management,
 
 - **Profile isolation** — each profile gets its own `CLAUDE_CONFIG_DIR` (separate history, settings, auth)
 - **TUI dashboard** — interactive terminal UI with profiles, history browser, auth manager, settings
-- **Auth management** — OAuth login, API key storage, token expiry tracking (via system keychain on Windows/macOS)
+- **Auth management** — OAuth login, API key storage, token refresh, token expiry tracking (via system keychain on Windows/macOS/Linux)
 - **Session browser** — browse, search, and resume conversations across all profiles
 - **Session migration** — move a conversation from one profile to another
+- **Cross-profile session resume** — resume a session from any profile without switching
 - **Shell integration** — auto-generated `claude-work`, `claude-personal` functions + `claudex-switch`
 - **Auto-switch** — place a `.claudeprofile` file in a project dir to auto-switch on `cd`
-- **Cross-platform** — Windows (PowerShell + Credential Manager), macOS (Keychain), Linux (file-based)
+- **Encrypted cross-machine sharing** — push a profile (config + credentials, no history) to a remote server as an AES-256-GCM encrypted bundle; pull it on any other machine with a share token
+- **MCP sharing** — register your sharing endpoint as an MCP server so Claude Code sessions can `share_profile` / `pull_profile` as native tools
+- **Configurable sharing endpoint** — point `claudex` at any compatible server; no URL is hardcoded
+- **Cross-platform** — Windows (PowerShell + Credential Manager), macOS (Keychain), Linux (Secret Service / file-based)
 
 ---
 
@@ -108,6 +112,17 @@ claudex shell setup             Install shell integration
 claudex shell hook              Print shell snippet
 
 claudex doctor                  Diagnose installation issues
+
+claudex config set <key> <val>  Set a global config value
+claudex config get <key>        Get a global config value
+
+claudex share auth              Log in to the sharing server
+claudex share push <name>       Encrypt and upload a profile; prints share token
+claudex share pull <token> <n>  Download and decrypt a profile to a new name
+claudex share list              List your uploaded shares
+claudex share revoke <id>       Revoke an uploaded share
+
+claudex mcp setup <name>        Register the sharing MCP server for a profile
 ```
 
 ---
@@ -126,6 +141,40 @@ claudex doctor                  Diagnose installation issues
 **Profile dashboard actions:** `n` new, `d` delete, `Enter` switch, `l` launch, `a` auth
 
 **History browser actions:** `Enter` resume, `m` migrate, `x` delete, `/` search
+
+---
+
+## Cross-machine profile sharing
+
+Share a profile (config, MCP servers, CLAUDE.md, credentials — but **not** session history) between machines using AES-256-GCM encryption. The server stores only ciphertext; the decryption key is embedded in the share token and never leaves the client.
+
+**Step 1 — Configure your sharing server:**
+```bash
+claudex config set sharing.endpoint https://yourserver.com
+```
+
+**Step 2 — Authenticate and push (Computer 1):**
+```bash
+claudex share auth                          # log in once; JWT stored in keychain
+claudex share push work --label "laptop"    # prints: cx_AbCdEf...  (save this token)
+```
+
+**Step 3 — Pull on another machine (Computer 2):**
+```bash
+claudex share auth                          # log in on this machine too
+claudex share pull cx_AbCdEf... work-copy   # decrypts and reconstructs profile
+claudex use work-copy                       # launch immediately — credentials restored
+```
+
+**MCP method (inside a Claude Code session):**
+```bash
+claudex mcp setup work                      # writes mcp_servers.json for the profile
+# Then in a Claude Code session with that profile:
+# → call share_profile tool to push
+# → call pull_profile tool to pull
+```
+
+The encryption design: a 32-byte AES key is generated locally, the tar.gz bundle is encrypted, ciphertext is uploaded, and the share token encodes `base64url(uuid_bytes + aes_key)`. The server cannot decrypt stored bundles.
 
 ---
 
