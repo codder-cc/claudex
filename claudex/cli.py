@@ -845,7 +845,17 @@ def share_push(profile_name: str, label: Optional[str], expires_days: Optional[i
     from claudex.core.profile_bundle import export_bundle
     from claudex.crypto import generate_key, encrypt, encode_share_token
     from claudex.core.sharing_client import load_client, SharingAPIError
+    from claudex.core.auth import AuthManager
     import base64
+
+    # Flush latest tokens from OS Keychain → .credentials.json so the bundle
+    # always contains a fresh accessToken + refreshToken.
+    auth_mgr = AuthManager()
+    flushed = auth_mgr.flush_credentials_to_file(profile_name, profile.config_dir)
+    if flushed:
+        console.print("[dim]Credentials flushed to bundle (accessToken + refreshToken)[/dim]")
+    else:
+        console.print("[yellow]Warning:[/yellow] No credentials found for this profile — bundle will have no auth tokens.")
 
     try:
         bundle_bytes = export_bundle(profile.config_dir)
@@ -943,6 +953,17 @@ def share_pull(share_token: str, new_profile_name: str, endpoint: Optional[str])
     except Exception as e:
         console.print(f"[red]Failed to extract bundle:[/red] {e}")
         sys.exit(1)
+
+    # Import credentials from the extracted .credentials.json into the local
+    # credential backend (keyring) and OS Keychain (macOS) so Claude Code and
+    # `claudex auth status` both work without a manual re-login.
+    from claudex.core.auth import AuthManager
+    auth_mgr = AuthManager()
+    imported = auth_mgr.import_credentials_from_file(new_profile_name, target_config_dir)
+    if imported:
+        console.print("[dim]Credentials imported into local keyring (accessToken + refreshToken)[/dim]")
+    else:
+        console.print("[yellow]Note:[/yellow] No credentials found in bundle. Run `claudex auth add` to authenticate.")
 
     console.print()
     console.print(f"[green]✓[/green] Profile [bold]{new_profile_name}[/bold] restored!")

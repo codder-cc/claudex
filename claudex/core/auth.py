@@ -222,6 +222,82 @@ class AuthManager:
         for key in ["oauth_token", "refresh_token", "api_key", "auth_type", "email", "expires_at"]:
             self.backend.delete(profile_name, key)
 
+    def flush_credentials_to_file(self, profile_name: str, config_dir: Path) -> bool:
+        """Read the latest tokens from the credential backend (or OS Keychain) and
+        write them to .credentials.json inside *config_dir*.
+
+        Called before bundling a profile for sharing so the archive always
+        contains a fresh accessToken + refreshToken regardless of where the
+        tokens are normally stored (Keychain on macOS, etc.).
+
+        Returns True if any credentials were found and written.
+        """
+        # Try claudex backend first
+        access_token = (
+            self.backend.retrieve(profile_name, "oauth_token") or
+            self.backend.retrieve(profile_name, "api_key") or ""
+        )
+        refresh_token = self.backend.retrieve(profile_name, "refresh_token") or ""
+        expires_at_str = self.backend.retrieve(profile_name, "expires_at") or ""
+
+        if not access_token:
+            # Fall back to reading from .credentials.json / OS Keychain
+            _, _, expires_dt, access_token = self._read_claude_creds(config_dir)
+            # _read_claude_creds stashes refresh into a temp key
+            tmp_refresh = self.backend.retrieve("_tmp_refresh", "refresh_token") or ""
+            if tmp_refresh:
+                refresh_token = tmp_refresh
+                self.backend.delete("_tmp_refresh", "refresh_token")
+            if expires_dt and not expires_at_str:
+                expires_at_str = expires_dt.isoformat()
+
+        if not access_token:
+            return False
+
+        expires_at_ms: Optional[float] = None
+        if expires_at_str:
+            try:
+                dt = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+                expires_at_ms = dt.timestamp() * 1000
+            except ValueError:
+                pass
+
+        self._write_credentials_file(config_dir, access_token, refresh_token, expires_at_ms)
+        return True
+
+    def import_credentials_from_file(self, profile_name: str, config_dir: Path) -> bool:
+        """Import credentials from .credentials.json into the local credential backend.
+
+        Called after extracting a share bundle on a new machine to populate
+        the claudex keyring entry and (on macOS) the Keychain so that both
+        `claudex auth status` and Claude Code itself work immediately.
+
+        Returns True if credentials were found and imported.
+        """
+        auth_type, email, expires_at, access_token = self._read_claude_creds(config_dir)
+        if not access_token:
+            return False
+
+        refresh_token = self.backend.retrieve("_tmp_refresh", "refresh_token") or ""
+        if refresh_token:
+            self.backend.delete("_tmp_refresh", "refresh_token")
+
+        self.backend.store(profile_name, "oauth_token", access_token)
+        self.backend.store(profile_name, "auth_type", auth_type)
+        if email:
+            self.backend.store(profile_name, "email", email)
+        if expires_at:
+            self.backend.store(profile_name, "expires_at", expires_at.isoformat())
+        if refresh_token:
+            self.backend.store(profile_name, "refresh_token", refresh_token)
+
+        # On macOS write to Keychain so Claude Code finds the token via its primary path
+        if IS_MACOS:
+            expires_at_ms: Optional[float] = expires_at.timestamp() * 1000 if expires_at else None
+            self._write_macos_keychain(config_dir, access_token, refresh_token, expires_at_ms)
+
+        return True
+
     def _write_credentials_file(
         self,
         config_dir: Path,
