@@ -228,16 +228,43 @@ class AuthManager:
 
         Called before bundling a profile for sharing so the archive always
         contains a fresh accessToken + refreshToken regardless of where the
-        tokens are normally stored (Keychain on macOS, etc.).
+        tokens are normally stored (Keychain on macOS, etc.).  Includes all
+        metadata fields (scopes, subscriptionType, rateLimitTier) so that the
+        restored profile on the target machine is indistinguishable from a
+        native login.
 
         Returns True if any credentials were found and written.
         """
-        # Try claudex backend first
+        # On macOS, Claude Code's primary credential store is the Keychain.
+        # Read the FULL Keychain blob first so we capture scopes, subscriptionType,
+        # rateLimitTier and other metadata fields that Claude Code needs.
+        full_oauth_block: dict = {}
+        if IS_MACOS:
+            import getpass
+            suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+            account = getpass.getuser()
+            service = f"Claude Code-credentials-{suffix}"
+            try:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    keychain_data = json.loads(result.stdout.strip())
+                    full_oauth_block = keychain_data.get("claudeAiOauth") or {}
+            except Exception:
+                pass
+
+        # Try claudex backend for the core token fields
         access_token = (
             self.backend.retrieve(profile_name, "oauth_token") or
-            self.backend.retrieve(profile_name, "api_key") or ""
+            self.backend.retrieve(profile_name, "api_key") or
+            full_oauth_block.get("accessToken", "")
         )
-        refresh_token = self.backend.retrieve(profile_name, "refresh_token") or ""
+        refresh_token = (
+            self.backend.retrieve(profile_name, "refresh_token") or
+            full_oauth_block.get("refreshToken", "")
+        )
         expires_at_str = self.backend.retrieve(profile_name, "expires_at") or ""
 
         if not access_token:
@@ -262,7 +289,16 @@ class AuthManager:
             except ValueError:
                 pass
 
-        self._write_credentials_file(config_dir, access_token, refresh_token, expires_at_ms)
+        # Merge: start from the full Keychain block (preserves scopes etc.),
+        # then overwrite the 3 mutable fields with freshest values.
+        if full_oauth_block:
+            full_oauth_block["accessToken"] = access_token
+            full_oauth_block["refreshToken"] = refresh_token
+            if expires_at_ms is not None:
+                full_oauth_block["expiresAt"] = int(expires_at_ms)
+            self._write_credentials_file_full(config_dir, full_oauth_block)
+        else:
+            self._write_credentials_file(config_dir, access_token, refresh_token, expires_at_ms)
         return True
 
     def import_credentials_from_file(self, profile_name: str, config_dir: Path) -> bool:
@@ -272,29 +308,62 @@ class AuthManager:
         the claudex keyring entry and (on macOS) the Keychain so that both
         `claudex auth status` and Claude Code itself work immediately.
 
+        Restores the FULL claudeAiOauth block (including scopes, subscriptionType,
+        rateLimitTier) so Claude Code recognises the session as fully authenticated.
+
         Returns True if credentials were found and imported.
         """
-        auth_type, email, expires_at, access_token = self._read_claude_creds(config_dir)
+        # Read the full credentials file — we need ALL fields in the claudeAiOauth
+        # block, not just the 3 that _read_claude_creds returns.
+        cred_file = config_dir / ".credentials.json"
+        full_oauth_block: dict = {}
+        if cred_file.exists():
+            try:
+                data = json.loads(cred_file.read_text(encoding="utf-8"))
+                full_oauth_block = data.get("claudeAiOauth") or {}
+            except Exception:
+                pass
+
+        access_token = full_oauth_block.get("accessToken", "")
+        refresh_token = full_oauth_block.get("refreshToken", "")
+        expires_ms = full_oauth_block.get("expiresAt")
+
+        if not access_token:
+            # Fallback: use the standard reader
+            auth_type_fb, email_fb, expires_at_fb, access_token = self._read_claude_creds(config_dir)
+            refresh_token = self.backend.retrieve("_tmp_refresh", "refresh_token") or refresh_token
+            if refresh_token:
+                self.backend.delete("_tmp_refresh", "refresh_token")
+            expires_ms = expires_at_fb.timestamp() * 1000 if expires_at_fb else None
+        else:
+            auth_type_fb = "oauth" if access_token.startswith("sk-ant-oat") else "api_key"
+            email_fb = ""
+            expires_at_fb = None
+            if isinstance(expires_ms, (int, float)):
+                from datetime import datetime, timezone
+                expires_at_fb = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
+            # Drain any stale temp key
+            self.backend.delete("_tmp_refresh", "refresh_token")
+
         if not access_token:
             return False
 
-        refresh_token = self.backend.retrieve("_tmp_refresh", "refresh_token") or ""
-        if refresh_token:
-            self.backend.delete("_tmp_refresh", "refresh_token")
-
         self.backend.store(profile_name, "oauth_token", access_token)
-        self.backend.store(profile_name, "auth_type", auth_type)
-        if email:
-            self.backend.store(profile_name, "email", email)
-        if expires_at:
-            self.backend.store(profile_name, "expires_at", expires_at.isoformat())
+        self.backend.store(profile_name, "auth_type", auth_type_fb)
+        if email_fb:
+            self.backend.store(profile_name, "email", email_fb)
+        if expires_at_fb:
+            self.backend.store(profile_name, "expires_at", expires_at_fb.isoformat())
         if refresh_token:
             self.backend.store(profile_name, "refresh_token", refresh_token)
 
-        # On macOS write to Keychain so Claude Code finds the token via its primary path
-        if IS_MACOS:
-            expires_at_ms: Optional[float] = expires_at.timestamp() * 1000 if expires_at else None
-            self._write_macos_keychain(config_dir, access_token, refresh_token, expires_at_ms)
+        # On macOS write the FULL oauth block to the Keychain (including scopes,
+        # subscriptionType, rateLimitTier) so Claude Code sees a complete session.
+        if IS_MACOS and full_oauth_block:
+            self._write_macos_keychain_full(config_dir, full_oauth_block)
+        elif IS_MACOS:
+            self._write_macos_keychain(config_dir, access_token, refresh_token,
+                                       expires_ms if isinstance(expires_ms, (int, float)) else None)
 
         return True
 
@@ -323,6 +392,22 @@ class AuthManager:
 
         cred_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         # Restrict to owner-only (same as Claude Code does)
+        try:
+            cred_file.chmod(0o600)
+        except Exception:
+            pass
+
+    def _write_credentials_file_full(self, config_dir: Path, oauth_block: dict) -> None:
+        """Write a complete claudeAiOauth block (all fields) to .credentials.json."""
+        cred_file = config_dir / ".credentials.json"
+        existing: dict = {}
+        if cred_file.exists():
+            try:
+                existing = json.loads(cred_file.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        existing["claudeAiOauth"] = oauth_block
+        cred_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         try:
             cred_file.chmod(0o600)
         except Exception:
@@ -367,6 +452,27 @@ class AuthManager:
             )
         except Exception:
             pass  # Non-fatal: .credentials.json is the primary fallback
+
+    def _write_macos_keychain_full(self, config_dir: Path, oauth_block: dict) -> None:
+        """Write a complete claudeAiOauth block (all fields) to the macOS Keychain.
+
+        Used during profile import to restore scopes, subscriptionType, rateLimitTier
+        and any other metadata that Claude Code needs to show a fully authenticated
+        session rather than "Not logged in".
+        """
+        import getpass
+        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        account = getpass.getuser()
+        service = f"Claude Code-credentials-{suffix}"
+        blob = json.dumps({"claudeAiOauth": oauth_block})
+        try:
+            subprocess.run(
+                ["security", "add-generic-password",
+                 "-s", service, "-a", account, "-w", blob, "-U"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
 
     def _import_claude_credentials(self, profile_name: str, config_dir: Path) -> None:
         """Read credentials Claude wrote during /login and store them in our backend."""
