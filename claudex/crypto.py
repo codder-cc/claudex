@@ -72,6 +72,11 @@ def decode_share_token(token: str) -> Tuple[str, bytes]:
     Raises:
         ValueError: if the token is malformed.
     """
+    if not token.isascii():
+        raise ValueError(
+            "Share token contains non-ASCII characters (possible Cyrillic/Unicode lookalikes). "
+            "Copy-paste the token directly from `claudex share push` output — do not retype it."
+        )
     if not token.startswith("cx_"):
         raise ValueError("Not a valid claudex share token (expected 'cx_' prefix)")
 
