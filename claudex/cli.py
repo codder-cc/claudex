@@ -505,6 +505,31 @@ def auth_revoke(name: str) -> None:
     console.print(f"[green]✓[/green] Credentials cleared for '{name}'")
 
 
+@auth_group.command("relogin")
+@click.argument("name")
+def auth_relogin(name: str) -> None:
+    """Re-authenticate a profile by running `claude /login` with that profile's config dir.
+
+    Use this when OAuth tokens have expired or become invalid (e.g. after pulling
+    a profile from another machine).  Your profile settings, MCP servers, and
+    CLAUDE.md are preserved — only the auth tokens are renewed.
+    """
+    try:
+        pm = _pm()
+        profile = pm.get(name)
+        am = _auth()
+        console.print(f"[cyan]Starting OAuth login for profile [bold]{name}[/bold]...[/cyan]")
+        console.print("[dim]A browser window will open. Complete the login flow, then return here.[/dim]")
+        am.add_account_oauth(name, profile.config_dir)
+        console.print(f"[green]✓[/green] Re-authentication complete for profile '{name}'")
+        console.print()
+        console.print("Launch Claude with this profile:")
+        console.print(f"  [cyan]claudex use {name}[/cyan]")
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
 # ─── Session commands ──────────────────────────────────────────────────────────
 
 @cli.group("session")
@@ -1003,29 +1028,35 @@ def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[st
     from claudex.core.auth import AuthManager
     auth_mgr = AuthManager()
     imported = auth_mgr.import_credentials_from_file(new_profile_name, target_config_dir)
+    creds_ok = False
     if imported:
-        console.print("[dim]Credentials imported into local keyring (accessToken + refreshToken)[/dim]")
-        # Try to refresh immediately if the access token is already expired
+        console.print("[dim]Credentials found in bundle — importing into local keyring...[/dim]")
+        # Try to refresh immediately — always attempt refresh after pull because the source
+        # machine may have already refreshed its session, making the bundled access token
+        # server-side invalid even if the client-side expiresAt hasn't passed yet.
         try:
-            status = auth_mgr.get_status(new_profile_name, target_config_dir)
-            if status.is_expired and status.refresh_available:
-                console.print("[cyan]Access token expired — refreshing automatically...[/cyan]")
-                auth_mgr.refresh_token(new_profile_name, target_config_dir)
-                console.print("[dim]Token refreshed.[/dim]")
+            console.print("[cyan]Verifying OAuth tokens (refreshing session)...[/cyan]")
+            auth_mgr.refresh_token(new_profile_name, target_config_dir)
+            console.print("[green]✓[/green] [dim]Credentials verified and refreshed.[/dim]")
+            creds_ok = True
         except Exception as refresh_err:
-            console.print(f"[yellow]Token refresh failed:[/yellow] {refresh_err}")
-            console.print(f"  Run: [cyan]claudex auth add {new_profile_name}[/cyan]")
+            console.print(f"[yellow]Warning:[/yellow] Could not refresh OAuth token: {refresh_err}")
+            console.print("[yellow]The bundled tokens may have been invalidated on the source machine.[/yellow]")
     else:
-        console.print(f"[yellow]No credentials in bundle.[/yellow] Run: [cyan]claudex auth add {new_profile_name}[/cyan]")
+        console.print(f"[yellow]No credentials in bundle.[/yellow]")
 
     console.print()
     console.print(f"[green]✓[/green] Profile [bold]{new_profile_name}[/bold] restored!")
     console.print()
-    console.print("Verify credentials:")
-    console.print(f"  [cyan]claudex auth status[/cyan]")
-    console.print()
-    console.print("Launch with this profile:")
-    console.print(f"  [cyan]claudex use {new_profile_name}[/cyan]")
+    if creds_ok:
+        console.print("Launch with this profile:")
+        console.print(f"  [cyan]claudex use {new_profile_name}[/cyan]")
+    else:
+        console.print("[bold yellow]Action required — re-authenticate:[/bold yellow]")
+        console.print(f"  [cyan]claudex auth relogin {new_profile_name}[/cyan]")
+        console.print()
+        console.print("[dim]  (This runs `claude /login` with your profile — takes ~30 seconds.[/dim]")
+        console.print("[dim]   Your profile config, MCP servers, and settings are all intact.)[/dim]")
 
 
 @share_group.command("list")
