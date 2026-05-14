@@ -20,6 +20,7 @@ Manage multiple Claude Code accounts with full session history, auth management,
 - **MCP sharing** — register your sharing endpoint as an MCP server so Claude Code sessions can `share_profile` / `pull_profile` as native tools
 - **Configurable sharing endpoint** — point `claudex` at any compatible server; no URL is hardcoded
 - **Cross-platform** — Windows (PowerShell + Credential Manager), macOS (Keychain), Linux (Secret Service / file-based)
+- **Self-update** — `claudex update` fast-forwards the local checkout (if pipx was installed from a path) and runs `pipx install --force`
 
 ---
 
@@ -112,6 +113,7 @@ claudex shell setup             Install shell integration
 claudex shell hook              Print shell snippet
 
 claudex doctor                  Diagnose installation issues
+claudex update [--ref REF]      Pull latest source and reinstall via pipx
 
 claudex config set <key> <val>  Set a global config value
 claudex config get <key>        Get a global config value
