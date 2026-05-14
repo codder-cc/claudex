@@ -1046,7 +1046,7 @@ def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[st
         # server-side invalid even if the client-side expiresAt hasn't passed yet.
         try:
             console.print("[cyan]Verifying OAuth tokens (refreshing session)...[/cyan]")
-            auth_mgr.refresh_token(new_profile_name, target_config_dir)
+            auth_mgr.refresh(new_profile_name, target_config_dir)
             console.print("[green]✓[/green] [dim]Credentials verified and refreshed.[/dim]")
             creds_ok = True
         except Exception as refresh_err:
