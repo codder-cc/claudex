@@ -54,6 +54,7 @@ Usage:
 
   -- Other --
   claudex doctor                        Diagnose installation issues
+  claudex update [--ref REF]            Pull latest source and reinstall via pipx
   claudex export <name>                 Export profile to .tar.gz
   claudex import <file>                 Import profile from .tar.gz
 """
@@ -742,6 +743,15 @@ def doctor_cmd() -> None:
     """Diagnose installation and configuration issues."""
     from claudex.commands.doctor import run_doctor
     run_doctor()
+
+
+@cli.command("update")
+@click.option("--ref", default=None,
+              help="git ref to update to (branch/tag/commit). Defaults to current branch's upstream.")
+def update_cmd(ref: Optional[str]) -> None:
+    """Pull latest claudex source and reinstall via pipx."""
+    from claudex.commands.update import run_update
+    run_update(ref=ref)
 
 
 # ─── Internal (used by shell functions) ───────────────────────────────────────
