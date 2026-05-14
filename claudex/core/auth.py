@@ -166,11 +166,18 @@ class AuthManager:
             "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
         }).encode()
 
+        # Cloudflare in front of platform.claude.com returns error 1010 ("browser
+        # signature banned") for the default Python-urllib UA, so masquerade as a
+        # generic CLI client. Don't drop the anthropic-beta header — the endpoint
+        # is gated on it.
+        from claudex import __version__ as _claudex_version  # local import to avoid cycles
         req = urllib.request.Request(
             "https://platform.claude.com/v1/oauth/token",
             data=payload,
             headers={
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"claudex/{_claudex_version} (+https://github.com/codder-cc/claudex)",
                 "anthropic-beta": "oauth-2025-04-20",
             },
             method="POST",
