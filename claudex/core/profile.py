@@ -63,7 +63,10 @@ class Profile:
     def from_toml(cls, path: Path) -> "Profile":
         with open(path, "rb") as f:
             data = tomllib.load(f)
-        data["config_dir"] = Path(data.get("config_dir", str(path.parent)))
+        # Always trust the on-disk location: a stored config_dir can be alien (a pulled
+        # bundle carries the source machine's home path) and would point us at a
+        # directory we can't even write to.
+        data["config_dir"] = path.parent
         if "created_at" in data and isinstance(data["created_at"], str):
             data["created_at"] = datetime.fromisoformat(data["created_at"])
         if "last_used" in data and isinstance(data["last_used"], str) and data["last_used"]:
