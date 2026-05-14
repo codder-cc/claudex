@@ -1009,11 +1009,11 @@ def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[st
     profile_toml = target_config_dir / "profile.toml"
     if profile_toml.exists():
         try:
-            import tomllib as _tomllib
-        except ImportError:
-            import tomli as _tomllib  # type: ignore
-        import tomli_w as _tomli_w  # type: ignore[import]
-        try:
+            try:
+                import tomllib as _tomllib
+            except ImportError:
+                import tomli as _tomllib  # type: ignore
+            import tomli_w as _tomli_w  # type: ignore[import]
             data = _tomllib.loads(profile_toml.read_text(encoding="utf-8"))
             data["name"] = new_profile_name
             profile_toml.write_text(_tomli_w.dumps(data), encoding="utf-8")
