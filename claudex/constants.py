@@ -7,6 +7,7 @@ from pathlib import Path
 CLAUDEX_HOME = Path.home() / ".claudex"
 PROFILES_DIR = CLAUDEX_HOME / "profiles"
 SHARED_DIR = CLAUDEX_HOME / "shared"
+FLEET_DIR = CLAUDEX_HOME / "fleet"
 GLOBAL_CONFIG_FILE = CLAUDEX_HOME / "config.toml"
 
 # Runtime state files (written by Python, sourced by shell)

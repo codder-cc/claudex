@@ -45,8 +45,20 @@ Usage:
   claudex share list [--endpoint URL]           List your shares on the server
   claudex share revoke <token-id> [--endpoint URL]  Revoke a share
 
+  -- Fleet (multi-subscription agents) --
+  claudex fleet dispatch "<prompt>" [-p name]   Run a headless `claude -p` job (auto-picks a profile)
+  claudex fleet status [job_id]                 Show one job or a table of all
+  claudex fleet result <job_id> [--raw]         Print a job's result
+  claudex fleet logs <job_id> [--follow]        Tail a job's output log
+  claudex fleet list [--status S] [-p name]     List jobs (advances the queue)
+  claudex fleet cancel <job_id>                 Cancel a queued/running job
+  claudex fleet tick [--max-starts N]           Advance the queue once (cron-friendly)
+  claudex fleet fanout --task T --subtask S ... Fan one task out across profiles
+
   -- MCP --
   claudex mcp setup <profile> [--endpoint URL]  Register sharing MCP server in a profile
+  claudex mcp setup <profile> --fleet           Register the local fleet MCP server (stdio)
+  claudex mcp serve                             Run the local fleet MCP server (used by Claude)
 
   -- Config --
   claudex config set sharing.endpoint <url>     Set default sharing endpoint
@@ -1146,28 +1158,87 @@ def mcp_group() -> None:
     """MCP server management for Claude Code integration."""
 
 
+def _register_mcp_server(profile, server_name: str, entry: dict) -> None:
+    """Merge an MCP server entry into a profile's mcp_servers.json."""
+    import json as _json
+
+    mcp_path = profile.config_dir / "mcp_servers.json"
+    if mcp_path.exists():
+        try:
+            mcp_config = _json.loads(mcp_path.read_text(encoding="utf-8"))
+        except Exception:
+            mcp_config = {}
+    else:
+        mcp_config = {}
+    mcp_config[server_name] = entry
+    mcp_path.write_text(_json.dumps(mcp_config, indent=2) + "\n", encoding="utf-8")
+
+
+@mcp_group.command("serve")
+@click.option("--transport", default="stdio", type=click.Choice(["stdio"]),
+              help="MCP transport (only stdio supported)")
+def mcp_serve(transport: str) -> None:
+    """Run the local fleet MCP server (blocking). Launched by Claude over stdio."""
+    try:
+        from claudex.fleet.mcp_server import serve_stdio
+    except ImportError:
+        console.print(
+            r"[red]The fleet MCP server needs the 'mcp' SDK.[/red]" "\n"
+            r"  Install with: [cyan]pipx install 'claudex\[fleet]'[/cyan] "
+            r"or [cyan]pip install 'claudex\[fleet]'[/cyan]"
+        )
+        sys.exit(1)
+    serve_stdio()
+
+
 @mcp_group.command("setup")
 @click.argument("profile_name")
 @click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
-@click.option("--name", "server_name", default="claudex-sharing",
-              help="MCP server name in mcp_servers.json (default: claudex-sharing)")
-def mcp_setup(profile_name: str, endpoint: Optional[str], server_name: str) -> None:
-    """Register the claudex sharing MCP server in a profile's mcp_servers.json.
+@click.option("--fleet", "fleet", is_flag=True,
+              help="Register the local fleet MCP server (stdio) instead of the sharing server")
+@click.option("--name", "server_name", default=None,
+              help="MCP server name in mcp_servers.json")
+def mcp_setup(profile_name: str, endpoint: Optional[str], fleet: bool,
+              server_name: Optional[str]) -> None:
+    """Register a claudex MCP server in a profile's mcp_servers.json.
 
-    After running this, start a Claude Code session with the profile and you can
-    use the share_profile, pull_profile, list_profiles, and revoke_profile tools
-    directly in a Claude conversation.
+    Default registers the sharing MCP server (share_profile, pull_profile, ...).
+    With --fleet, registers the local stdio fleet server so Claude can dispatch
+    agent jobs across your other subscriptions (fleet_dispatch, fleet_status, ...).
     """
     import json as _json
 
-    ep = _resolve_endpoint(endpoint)
     pm = _pm()
-
     try:
         profile = pm.get(profile_name)
     except ClaudexError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
+
+    if fleet:
+        name = server_name or "claudex-fleet"
+        claudex_bin = shutil.which("claudex")
+        if claudex_bin:
+            command, args = claudex_bin, ["mcp", "serve"]
+        else:
+            command, args = sys.executable, ["-m", "claudex.cli", "mcp", "serve"]
+        _register_mcp_server(profile, name, {
+            "type": "stdio",
+            "command": command,
+            "args": args,
+        })
+        console.print(f"[green]✓[/green] Fleet MCP server [bold]{name}[/bold] registered in profile [bold]{profile_name}[/bold]")
+        console.print()
+        console.print("Start a Claude Code session:")
+        console.print(f"  [cyan]claudex use {profile_name}[/cyan]")
+        console.print()
+        console.print("Then use these MCP tools in your conversation:")
+        console.print("  [dim]fleet_dispatch[/dim], [dim]fleet_status[/dim], [dim]fleet_result[/dim], "
+                      "[dim]fleet_fanout[/dim], [dim]fleet_list_profiles[/dim], [dim]fleet_cancel[/dim]")
+        return
+
+    server_name = server_name or "claudex-sharing"
+    ep = _resolve_endpoint(endpoint)
 
     # Load JWT from credential backend
     from claudex.core.sharing_client import SharingCredentials
@@ -1207,6 +1278,248 @@ def mcp_setup(profile_name: str, endpoint: Optional[str], server_name: str) -> N
     console.print()
     console.print("Then use these MCP tools in your Claude conversation:")
     console.print("  [dim]share_profile[/dim], [dim]pull_profile[/dim], [dim]list_profiles[/dim], [dim]revoke_profile[/dim]")
+
+
+# ─── Fleet commands ───────────────────────────────────────────────────────────
+
+@cli.group("fleet")
+def fleet_group() -> None:
+    """Run headless `claude -p` agent jobs across multiple profiles (subscriptions)."""
+
+
+def _engine():
+    from claudex.fleet.engine import FleetEngine
+    return FleetEngine()
+
+
+def _status_style(status: str) -> str:
+    return {
+        "succeeded": "green",
+        "running": "cyan",
+        "assigned": "cyan",
+        "queued": "yellow",
+        "rate_limited": "yellow",
+        "failed": "red",
+        "cancelled": "dim",
+    }.get(status, "white")
+
+
+@fleet_group.command("dispatch")
+@click.argument("prompt")
+@click.option("--profile", "-p", default=None, help="Pin to a profile (default: auto-select)")
+@click.option("--cwd", default=None, help="Working directory for the agent")
+@click.option("--model", "-m", default=None, help="Model to use (passed to claude --model)")
+@click.option("--timeout", "timeout_s", type=int, default=None, help="Per-job timeout in seconds")
+@click.option("--max-attempts", type=int, default=3, help="Max attempts before giving up")
+@click.option("--wait", is_flag=True, help="Block and poll until the job reaches a terminal state")
+def fleet_dispatch(prompt, profile, cwd, model, timeout_s, max_attempts, wait) -> None:
+    """Dispatch a headless agent job. Prints the job id."""
+    eng = _engine()
+    job = eng.dispatch(
+        prompt, profile=profile, cwd=cwd, model=model,
+        timeout_s=timeout_s, max_attempts=max_attempts,
+    )
+    console.print(f"[green]✓[/green] Job [bold]{job.id}[/bold] "
+                  f"[{_status_style(job.status.value)}]{job.status.value}[/] "
+                  f"→ profile [bold]{job.profile or '—'}[/bold]")
+    if wait:
+        _wait_for_job(eng, job.id)
+
+
+def _wait_for_job(eng, job_id: str) -> None:
+    import time
+    with console.status(f"Running {job_id}…"):
+        while True:
+            job = eng.status(job_id)
+            if job.is_terminal():
+                break
+            time.sleep(2)
+    job = eng.status(job_id, tick_first=False)
+    console.print(f"Job [bold]{job.id}[/bold]: "
+                  f"[{_status_style(job.status.value)}]{job.status.value}[/]")
+    res = eng.result(job_id)
+    if res and res.result_text:
+        console.print(res.result_text)
+    elif res and res.error:
+        console.print(f"[red]{res.error}[/red]")
+
+
+@fleet_group.command("status")
+@click.argument("job_id", required=False)
+def fleet_status(job_id) -> None:
+    """Show one job, or a table of all jobs."""
+    eng = _engine()
+    if job_id:
+        job = eng.status(job_id)
+        console.print(f"[bold]{job.id}[/bold]  "
+                      f"[{_status_style(job.status.value)}]{job.status.value}[/]")
+        console.print(f"  profile : {job.profile or '—'}")
+        console.print(f"  attempts: {job.attempts}/{job.max_attempts}")
+        if job.failure_kind:
+            console.print(f"  failure : {job.failure_kind}")
+        if job.parent_id:
+            console.print(f"  parent  : {job.parent_id}")
+        if job.child_ids:
+            console.print(f"  children: {', '.join(job.child_ids)}")
+        console.print(f"  prompt  : {job.prompt[:120]}")
+        return
+    _print_job_table(eng.list_jobs())
+
+
+def _print_job_table(jobs) -> None:
+    if not jobs:
+        console.print("[yellow]No fleet jobs.[/yellow] Dispatch one: claudex fleet dispatch \"<prompt>\"")
+        return
+    import humanize
+    from datetime import datetime, timezone
+    table = Table(title="Fleet jobs", show_header=True, header_style="bold cyan")
+    table.add_column("ID", style="bold")
+    table.add_column("Status")
+    table.add_column("Profile")
+    table.add_column("Try")
+    table.add_column("Age")
+    table.add_column("Prompt")
+    for j in jobs:
+        try:
+            age = humanize.naturaltime(datetime.now(timezone.utc) - j.created_at)
+        except Exception:
+            age = "—"
+        kind = "orchestrator" if j.is_orchestrator else (j.profile or "—")
+        table.add_row(
+            j.id,
+            f"[{_status_style(j.status.value)}]{j.status.value}[/]",
+            kind,
+            f"{j.attempts}/{j.max_attempts}",
+            age,
+            (j.prompt[:50] + "…") if len(j.prompt) > 50 else j.prompt,
+        )
+    console.print(table)
+
+
+@fleet_group.command("list")
+@click.option("--status", "status_filter", default=None, help="Filter by status")
+@click.option("--profile", "-p", default=None, help="Filter by profile")
+def fleet_list(status_filter, profile) -> None:
+    """List fleet jobs (advances the queue first)."""
+    eng = _engine()
+    eng.tick()
+    from claudex.fleet.models import JobStatus
+    st = JobStatus(status_filter) if status_filter else None
+    _print_job_table(eng.list_jobs(status=st, profile=profile))
+
+
+@fleet_group.command("result")
+@click.argument("job_id")
+@click.option("--raw", is_flag=True, help="Print the raw result JSON")
+def fleet_result(job_id, raw) -> None:
+    """Print a job's result."""
+    eng = _engine()
+    res = eng.result(job_id)
+    if res is None:
+        console.print("[yellow]No result yet.[/yellow] Check: claudex fleet status " + job_id)
+        return
+    if raw:
+        import json as _json
+        console.print_json(_json.dumps(res.to_dict()))
+        return
+    if res.result_text:
+        console.print(res.result_text)
+    if res.error:
+        console.print(f"[red]{res.error}[/red]")
+    if res.cost_usd is not None:
+        console.print(f"[dim]cost ${res.cost_usd:.4f} · {res.num_turns} turns[/dim]")
+
+
+@fleet_group.command("logs")
+@click.argument("job_id")
+@click.option("--follow", "-f", is_flag=True, help="Follow the log (tail -f)")
+def fleet_logs(job_id, follow) -> None:
+    """Print (or follow) a job's combined stdout/stderr log."""
+    eng = _engine()
+    path = eng.logs_path(job_id)
+    if not path.exists():
+        console.print("[yellow]No log yet.[/yellow]")
+        return
+    if not follow:
+        console.print(path.read_text(encoding="utf-8", errors="replace"))
+        return
+    import time
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        console.print(f.read(), end="")
+        while True:
+            line = f.readline()
+            if line:
+                console.print(line, end="")
+            else:
+                time.sleep(0.5)
+
+
+@fleet_group.command("cancel")
+@click.argument("job_id")
+def fleet_cancel(job_id) -> None:
+    """Cancel a queued or running job."""
+    eng = _engine()
+    job = eng.cancel(job_id)
+    console.print(f"[green]✓[/green] Job [bold]{job.id}[/bold] "
+                  f"[{_status_style(job.status.value)}]{job.status.value}[/]")
+
+
+@fleet_group.command("tick")
+@click.option("--max-starts", type=int, default=None, help="Cap workers started this tick")
+def fleet_tick(max_starts) -> None:
+    """Advance the queue once (reconcile, retry, schedule). Cron-friendly."""
+    eng = _engine()
+    r = eng.tick(max_starts=max_starts)
+    console.print(f"reconciled={r.reconciled} retried={r.retried} "
+                  f"started={r.started} no-profile={r.skipped_no_profile}")
+
+
+@fleet_group.command("fanout")
+@click.option("--task", required=True, help="Parent task description")
+@click.option("--subtask", "subtasks", multiple=True, help="A subtask (repeatable)")
+@click.option("--subtasks-file", type=click.Path(exists=True), default=None,
+              help="File with one subtask per line")
+@click.option("--model", "-m", default=None, help="Model for children")
+@click.option("--timeout", "timeout_s", type=int, default=None, help="Per-child timeout (seconds)")
+def fleet_fanout(task, subtasks, subtasks_file, model, timeout_s) -> None:
+    """Fan one task out into parallel child jobs across profiles."""
+    subs = list(subtasks)
+    if subtasks_file:
+        subs += [ln.strip() for ln in Path(subtasks_file).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if not subs:
+        console.print("[red]Error:[/red] provide at least one --subtask or --subtasks-file")
+        sys.exit(1)
+    eng = _engine()
+    parent = eng.fan_out(task, subs, model=model, timeout_s=timeout_s)
+    console.print(f"[green]✓[/green] Orchestrator [bold]{parent.id}[/bold] "
+                  f"with {len(parent.child_ids)} children: {', '.join(parent.child_ids)}")
+    console.print(f"  Watch: [cyan]claudex fleet status {parent.id}[/cyan]")
+
+
+@fleet_group.command("clear")
+@click.option("--status", "status_filter", default=None, help="Only clear jobs in this status")
+@click.option("--all", "clear_all", is_flag=True, help="Clear all terminal jobs")
+def fleet_clear(status_filter, clear_all) -> None:
+    """Prune finished job records, logs, and results."""
+    eng = _engine()
+    from claudex.fleet.models import JobStatus
+    st = JobStatus(status_filter) if status_filter else None
+    jobs = eng.list_jobs(status=st)
+    n = 0
+    for j in jobs:
+        if clear_all or status_filter:
+            if j.is_terminal() or status_filter:
+                eng.store.delete_job(j.id)
+                n += 1
+    console.print(f"[green]✓[/green] Cleared {n} job(s)")
+
+
+@fleet_group.command("_run-worker", hidden=True)
+@click.argument("job_id")
+def fleet_run_worker(job_id) -> None:
+    """Internal: detached worker body. Not for direct use."""
+    from claudex.fleet.runner import run_worker
+    sys.exit(run_worker(job_id))
 
 
 if __name__ == "__main__":

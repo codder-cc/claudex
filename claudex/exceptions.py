@@ -45,3 +45,21 @@ class ClaudeNotFoundError(ClaudexError):
 
 class ParseError(ClaudexError):
     """JSONL parsing errors."""
+
+
+class FleetError(ClaudexError):
+    """Fleet orchestration errors."""
+
+
+class JobNotFoundError(FleetError):
+    def __init__(self, job_id: str):
+        super().__init__(f"Fleet job '{job_id}' not found. Run 'claudex fleet list' to see jobs.")
+        self.job_id = job_id
+
+
+class NoEligibleProfileError(FleetError):
+    def __init__(self, detail: str = ""):
+        msg = "No eligible profile available to run this job."
+        if detail:
+            msg += f" {detail}"
+        super().__init__(msg)

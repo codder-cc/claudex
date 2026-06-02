@@ -124,8 +124,61 @@ claudex share pull <token> <n>  Download and decrypt a profile to a new name
 claudex share list              List your uploaded shares
 claudex share revoke <id>       Revoke an uploaded share
 
+claudex fleet dispatch "<p>"    Run a headless `claude -p` job (auto-picks a profile)
+claudex fleet status [job]      Show one job or a table of all
+claudex fleet result <job>      Print a job's result
+claudex fleet logs <job> -f     Tail a job's output log
+claudex fleet fanout ...        Fan one task into parallel jobs across profiles
+claudex fleet cancel <job>      Cancel a queued/running job
+claudex fleet tick              Advance the queue once (cron-friendly)
+
 claudex mcp setup <name>        Register the sharing MCP server for a profile
+claudex mcp setup <name> --fleet  Register the local fleet MCP server (stdio)
+claudex mcp serve               Run the local fleet MCP server (launched by Claude)
 ```
+
+---
+
+## Fleet — run agents across multiple subscriptions
+
+Each profile is a separate Claude subscription. The **fleet** treats them as a
+worker pool: it runs headless `claude -p` jobs in detached background processes,
+routes each job to a profile that isn't rate-limited (auto-refreshing expired
+OAuth tokens), and spreads load so one account's usage limit doesn't block you.
+State lives under `~/.claudex/fleet/` — there is no daemon; the queue is advanced
+by `claudex fleet tick` (called automatically by every fleet command).
+
+```bash
+# Fire off a long task — the scheduler picks the least-loaded eligible profile
+claudex fleet dispatch "refactor the auth module and write tests"
+
+# Pin to a specific subscription
+claudex fleet dispatch "summarize docs/" --profile work --wait
+
+# Fan one task out into parallel sub-agents across your subscriptions
+claudex fleet fanout --task "port the test suite" \
+  --subtask "convert tests/unit to pytest" \
+  --subtask "convert tests/integration to pytest" \
+  --subtask "update CI config"
+
+claudex fleet status            # watch progress
+claudex fleet result <job_id>   # read the answer
+```
+
+### Letting Claude drive the fleet (MCP)
+
+Install the optional extra and register the local MCP server in a profile:
+
+```bash
+pipx install 'claudex[fleet]'        # adds the `mcp` SDK
+claudex mcp setup work --fleet       # writes a stdio server into the profile
+claudex use work                     # start Claude with that profile
+```
+
+Inside that Claude session, the tools `fleet_dispatch`, `fleet_status`,
+`fleet_result`, `fleet_fanout`, `fleet_cancel`, and `fleet_list_profiles` become
+available — so Claude can spawn agents onto your *other* subscriptions and gather
+their results, all from one conversation.
 
 ---
 
@@ -216,6 +269,11 @@ The shell integration generates functions that set `CLAUDE_CONFIG_DIR` in the pa
 ├── shared/                   # shared resources (symlinked into profiles)
 │   ├── CLAUDE.md
 │   └── settings.json
+├── fleet/                    # fleet job state (no daemon)
+│   ├── jobs/<id>.json        # one record per dispatched job
+│   ├── logs/<id>.log         # combined stdout/stderr of each `claude -p`
+│   ├── results/<id>.json     # parsed result per job
+│   └── cooldowns.json        # per-profile rate-limit cooldowns
 └── profiles/
     ├── work/
     │   ├── profile.toml      # profile metadata
