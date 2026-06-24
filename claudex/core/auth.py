@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -247,20 +246,8 @@ class AuthManager:
         # rateLimitTier and other metadata fields that Claude Code needs.
         full_oauth_block: dict = {}
         if IS_MACOS:
-            import getpass
-            suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
-            account = getpass.getuser()
-            service = f"Claude Code-credentials-{suffix}"
-            try:
-                result = subprocess.run(
-                    ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    keychain_data = json.loads(result.stdout.strip())
-                    full_oauth_block = keychain_data.get("claudeAiOauth") or {}
-            except Exception:
-                pass
+            keychain_data = self._read_macos_keychain_blob(config_dir) or {}
+            full_oauth_block = keychain_data.get("claudeAiOauth") or {}
 
         # Try claudex backend for the core token fields
         access_token = (
@@ -420,66 +407,101 @@ class AuthManager:
         except Exception:
             pass
 
+    def _macos_keychain_service(self, config_dir: Path) -> tuple[str, str]:
+        """The (service, account) Claude Code uses for this profile's Keychain entry.
+
+        NOTE: this mirrors Claude Code's reverse-engineered naming
+        (Claude Code-credentials-{sha256(config_dir)[:8]}, account = login user).
+        If a Claude version changes this, keychain writes will silently miss —
+        which is why writes are verified and `macos_keychain_token_present` exists.
+        """
+        import getpass
+        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        return f"Claude Code-credentials-{suffix}", getpass.getuser()
+
+    def _read_macos_keychain_blob(self, config_dir: Path) -> Optional[dict]:
+        """Read and parse the Claude Code keychain blob for this profile, or None."""
+        if not IS_MACOS:
+            return None
+        service, account = self._macos_keychain_service(config_dir)
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout.strip())
+        except Exception:
+            return None
+        return None
+
+    def macos_keychain_token_present(self, config_dir: Path) -> Optional[bool]:
+        """Whether the macOS Keychain entry Claude Code reads holds an access token.
+
+        This is the store Claude actually consumes on macOS — distinct from
+        .credentials.json / the claudex backend that `get_status` reads. Returns
+        None on non-macOS. Use it to detect the "claudex says authed but Claude
+        prompts to log in" cross-machine failure.
+        """
+        if not IS_MACOS:
+            return None
+        blob = self._read_macos_keychain_blob(config_dir) or {}
+        return bool((blob.get("claudeAiOauth") or {}).get("accessToken"))
+
+    def _keychain_add_verified(self, service: str, account: str, blob: str) -> bool:
+        """Write a keychain item and verify it reads back. Returns success."""
+        try:
+            r = subprocess.run(
+                ["security", "add-generic-password",
+                 "-s", service, "-a", account, "-w", blob, "-U"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode != 0:
+                return False
+        except Exception:
+            return False
+        # Verify the write actually landed (locked keychain / ACL can no-op).
+        try:
+            v = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return v.returncode == 0 and bool(v.stdout.strip())
+        except Exception:
+            return False
+
     def _write_macos_keychain(
         self,
         config_dir: Path,
         access_token: str,
         refresh_token: str,
         expires_at_ms: Optional[float],
-    ) -> None:
-        """Update the macOS Keychain entry Claude Code uses for this profile."""
-        import getpass
-        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
-        account = getpass.getuser()
-        service = f"Claude Code-credentials-{suffix}"
+    ) -> bool:
+        """Update the macOS Keychain entry Claude Code uses for this profile.
 
-        # Read current keychain blob so we can merge (preserves other fields)
-        try:
-            result = subprocess.run(
-                ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-                capture_output=True, text=True, timeout=5,
-            )
-            existing: dict = json.loads(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else {}
-        except Exception:
-            existing = {}
-
+        Returns True if the entry was written and verified. Non-fatal on failure
+        (.credentials.json is the fallback), but the result lets callers warn.
+        """
+        service, account = self._macos_keychain_service(config_dir)
+        existing = self._read_macos_keychain_blob(config_dir) or {}
         oauth_block = existing.get("claudeAiOauth") or {}
         oauth_block["accessToken"] = access_token
         oauth_block["refreshToken"] = refresh_token
         if expires_at_ms is not None:
             oauth_block["expiresAt"] = int(expires_at_ms)
         existing["claudeAiOauth"] = oauth_block
+        return self._keychain_add_verified(service, account, json.dumps(existing))
 
-        blob = json.dumps(existing)
-        try:
-            subprocess.run(
-                ["security", "add-generic-password",
-                 "-s", service, "-a", account, "-w", blob, "-U"],
-                capture_output=True, timeout=5,
-            )
-        except Exception:
-            pass  # Non-fatal: .credentials.json is the primary fallback
-
-    def _write_macos_keychain_full(self, config_dir: Path, oauth_block: dict) -> None:
+    def _write_macos_keychain_full(self, config_dir: Path, oauth_block: dict) -> bool:
         """Write a complete claudeAiOauth block (all fields) to the macOS Keychain.
 
         Used during profile import to restore scopes, subscriptionType, rateLimitTier
         and any other metadata that Claude Code needs to show a fully authenticated
-        session rather than "Not logged in".
+        session rather than "Not logged in". Returns True if written and verified.
         """
-        import getpass
-        suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
-        account = getpass.getuser()
-        service = f"Claude Code-credentials-{suffix}"
+        service, account = self._macos_keychain_service(config_dir)
         blob = json.dumps({"claudeAiOauth": oauth_block})
-        try:
-            subprocess.run(
-                ["security", "add-generic-password",
-                 "-s", service, "-a", account, "-w", blob, "-U"],
-                capture_output=True, timeout=5,
-            )
-        except Exception:
-            pass
+        return self._keychain_add_verified(service, account, blob)
 
     def _import_claude_credentials(self, profile_name: str, config_dir: Path) -> None:
         """Read credentials Claude wrote during /login and store them in our backend."""

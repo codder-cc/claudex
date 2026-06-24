@@ -34,6 +34,10 @@ from claudex.fleet.store import FleetStore, is_pid_alive
 # We also treat very old RUNNING jobs as dead to bound pid-reuse confusion.
 _MAX_RUNNING_WALL_CLOCK = timedelta(hours=6)
 
+# An ASSIGNED job whose worker never reached RUNNING within this window (and has
+# no live pid) is treated as a failed launch.
+_MAX_ASSIGN_WALL_CLOCK = timedelta(minutes=5)
+
 # Default global cap on concurrently starting workers per tick / in flight.
 DEFAULT_MAX_CONCURRENT = 8
 
@@ -159,6 +163,12 @@ class FleetEngine:
         job.finished_at = _now()
         job.pid = None
         self.store.save_job(job)
+        # Cascade cancel to children of an orchestrator so they stop consuming
+        # subscriptions once the parent is cancelled.
+        for cid in job.child_ids:
+            child = self.store.load_job(cid)
+            if child and not child.is_terminal():
+                self.cancel(cid)
         return job
 
     def logs_path(self, job_id: str) -> Path:
@@ -202,6 +212,32 @@ class FleetEngine:
                     self.store.save_job(claimed)
                     report.reconciled += 1
 
+        # ASSIGNED jobs whose detached worker died before reaching RUNNING (startup
+        # crash, OOM) would otherwise sit forever — reconcile only scanned RUNNING.
+        # A freshly-assigned job (pid not yet attached, recent) is left alone.
+        for job in self.store.list_jobs(status=JobStatus.ASSIGNED, include_orchestrators=False):
+            if self.store.has_result(job.id):
+                result = self.store.load_result(job.id)
+                if result:
+                    job.status = result.status
+                    job.finished_at = job.finished_at or _now()
+                    job.pid = None
+                    self.store.save_job(job)
+                    report.reconciled += 1
+                continue
+            pid_dead = job.pid is not None and not is_pid_alive(job.pid)
+            too_old = (now - job.updated_at) > _MAX_ASSIGN_WALL_CLOCK
+            if pid_dead or too_old:
+                claimed = self.store.compare_and_claim(
+                    job.id, JobStatus.ASSIGNED, JobStatus.FAILED
+                )
+                if claimed:
+                    claimed.failure_kind = FAIL_ERROR
+                    claimed.finished_at = _now()
+                    claimed.pid = None
+                    self.store.save_job(claimed)
+                    report.reconciled += 1
+
     def _retry(self, report: TickReport) -> None:
         candidates = self.store.list_jobs(
             status=JobStatus.RATE_LIMITED, include_orchestrators=False
@@ -225,9 +261,12 @@ class FleetEngine:
                 report.retried += 1
 
     def _schedule(self, report: TickReport, max_starts: Optional[int]) -> None:
-        running = len(self.store.list_jobs(status=JobStatus.RUNNING)) + len(
-            self.store.list_jobs(status=JobStatus.ASSIGNED)
-        )
+        # Orchestrator parents sit in RUNNING but own no worker process — they must
+        # NOT count against the worker concurrency budget, or enough concurrent
+        # fan-outs would consume the whole budget and deadlock scheduling.
+        running = len(
+            self.store.list_jobs(status=JobStatus.RUNNING, include_orchestrators=False)
+        ) + len(self.store.list_jobs(status=JobStatus.ASSIGNED, include_orchestrators=False))
         budget = self.max_concurrent - running
         if max_starts is not None:
             budget = min(budget, max_starts)
@@ -252,8 +291,11 @@ class FleetEngine:
                 continue
             try:
                 pid = runner.spawn_detached(self.store, claimed)
-                claimed.pid = pid
-                self.store.save_job(claimed)
+                # Attach the pid under the lock and ONLY if the job is still
+                # ASSIGNED — the detached worker may already have transitioned it
+                # to RUNNING (or terminal) for a fast job. A blind save_job here
+                # would clobber that transition back to ASSIGNED.
+                self.store.attach_pid(claimed.id, pid)
                 report.started += 1
                 budget -= 1
             except Exception as e:
@@ -319,5 +361,5 @@ class FleetEngine:
         except (ProcessLookupError, PermissionError):
             try:
                 os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            except (ProcessLookupError, PermissionError):
+                pass  # gone, or not ours to kill — cancellation proceeds regardless

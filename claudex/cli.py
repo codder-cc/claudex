@@ -110,13 +110,20 @@ def _auth() -> AuthManager:
     return AuthManager()
 
 
-def _seed_claude_json(config_dir: Path) -> None:
+def _seed_claude_json(config_dir: Path, seed_identity: bool = True) -> None:
     """Seed .claude.json in profile dir so interactive Claude skips the auth selector.
 
     Claude looks for .claude.json inside CLAUDE_CONFIG_DIR on startup to find the
     oauthAccount entry. Without it, interactive Claude shows the auth-type selection
     prompt even when .credentials.json is present (non-interactive -p works fine).
     We copy the essential fields from ~/.claude.json (home-level) to bootstrap it.
+
+    seed_identity: when False, the account-identity keys (oauthAccount, userID) are
+    NOT copied from the home profile. Use this after a fresh `auth add` /login,
+    where the profile may belong to a DIFFERENT account than the home login —
+    seeding the home account's oauthAccount there mismatches the just-stored token
+    and forces a second authentication. Claude writes the correct oauthAccount
+    itself during /login, so we must not overwrite it with the home account's.
     """
     import json as _json
 
@@ -125,9 +132,11 @@ def _seed_claude_json(config_dir: Path) -> None:
 
     # Fields that tell interactive Claude this profile is initialized
     SEED_KEYS = {
-        "oauthAccount", "userID", "hasCompletedOnboarding", "lastOnboardingVersion",
+        "hasCompletedOnboarding", "lastOnboardingVersion",
         "installMethod", "autoUpdates",
     }
+    if seed_identity:
+        SEED_KEYS |= {"oauthAccount", "userID"}
 
     seed_data: dict = {}
     if home_claude_json.exists():
@@ -361,7 +370,9 @@ def auth_add(name: str) -> None:
         am.add_account_oauth(name, profile.config_dir)
         profile.auth_type = "oauth"
         profile.save()
-        _seed_claude_json(profile.config_dir)
+        # Don't seed the home account's identity: this profile may be a different
+        # account, and Claude already wrote the correct oauthAccount during /login.
+        _seed_claude_json(profile.config_dir, seed_identity=False)
         console.print(f"[green]✓[/green] Auth configured for '{name}'")
     except ClaudexError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -1064,6 +1075,15 @@ def share_pull(label_or_token: str, new_profile_name: str, endpoint: Optional[st
         except Exception as refresh_err:
             console.print(f"[yellow]Warning:[/yellow] Could not refresh OAuth token: {refresh_err}")
             console.print("[yellow]The bundled tokens may have been invalidated on the source machine.[/yellow]")
+        # On macOS, Claude Code reads the Keychain, not .credentials.json. Verify the
+        # token actually landed there — otherwise claudex shows ✓ while Claude 401s.
+        kc = auth_mgr.macos_keychain_token_present(target_config_dir)
+        if kc is False:
+            creds_ok = False
+            console.print(
+                "[yellow]Warning:[/yellow] could not write the macOS Keychain entry "
+                "Claude Code reads (locked keychain or naming drift)."
+            )
     else:
         console.print(f"[yellow]No credentials in bundle.[/yellow]")
 
@@ -1304,6 +1324,19 @@ def _status_style(status: str) -> str:
     }.get(status, "white")
 
 
+def _parse_status(status_filter):
+    """Validate a --status value, exiting with a friendly error on a bad one."""
+    from claudex.fleet.models import JobStatus
+    if not status_filter:
+        return None
+    try:
+        return JobStatus(status_filter)
+    except ValueError:
+        valid = ", ".join(s.value for s in JobStatus)
+        console.print(f"[red]Error:[/red] invalid status '{status_filter}'. Valid: {valid}")
+        sys.exit(1)
+
+
 @fleet_group.command("dispatch")
 @click.argument("prompt")
 @click.option("--profile", "-p", default=None, help="Pin to a profile (default: auto-select)")
@@ -1326,13 +1359,24 @@ def fleet_dispatch(prompt, profile, cwd, model, timeout_s, max_attempts, wait) -
         _wait_for_job(eng, job.id)
 
 
-def _wait_for_job(eng, job_id: str) -> None:
+def _wait_for_job(eng, job_id: str, max_wait_s: int = 1800) -> None:
     import time
+    from claudex.fleet.models import JobStatus
+    deadline = time.monotonic() + max_wait_s
     with console.status(f"Running {job_id}…"):
         while True:
             job = eng.status(job_id)
             if job.is_terminal():
                 break
+            if time.monotonic() > deadline:
+                console.print(
+                    f"[yellow]Timed out waiting for {job_id} "
+                    f"(status: {job.status.value}).[/yellow]"
+                )
+                if job.status == JobStatus.QUEUED:
+                    console.print("[dim]Job is still queued — no eligible profile? "
+                                  "Check: claudex fleet status[/dim]")
+                return
             time.sleep(2)
     job = eng.status(job_id, tick_first=False)
     console.print(f"Job [bold]{job.id}[/bold]: "
@@ -1401,10 +1445,9 @@ def _print_job_table(jobs) -> None:
 @click.option("--profile", "-p", default=None, help="Filter by profile")
 def fleet_list(status_filter, profile) -> None:
     """List fleet jobs (advances the queue first)."""
+    st = _parse_status(status_filter)
     eng = _engine()
     eng.tick()
-    from claudex.fleet.models import JobStatus
-    st = JobStatus(status_filter) if status_filter else None
     _print_job_table(eng.list_jobs(status=st, profile=profile))
 
 
@@ -1499,19 +1542,29 @@ def fleet_fanout(task, subtasks, subtasks_file, model, timeout_s) -> None:
 @fleet_group.command("clear")
 @click.option("--status", "status_filter", default=None, help="Only clear jobs in this status")
 @click.option("--all", "clear_all", is_flag=True, help="Clear all terminal jobs")
-def fleet_clear(status_filter, clear_all) -> None:
-    """Prune finished job records, logs, and results."""
+@click.option("--force", is_flag=True, help="Also delete non-terminal (queued/running) jobs")
+def fleet_clear(status_filter, clear_all, force) -> None:
+    """Prune finished job records, logs, and results.
+
+    By default only terminal jobs (succeeded/failed/cancelled) are removed —
+    deleting a live job's record would orphan its detached worker. Use --force to
+    delete non-terminal jobs anyway.
+    """
+    st = _parse_status(status_filter)
+    if not (clear_all or status_filter):
+        console.print("[yellow]Nothing to do.[/yellow] Pass --all or --status <s>.")
+        return
     eng = _engine()
-    from claudex.fleet.models import JobStatus
-    st = JobStatus(status_filter) if status_filter else None
-    jobs = eng.list_jobs(status=st)
-    n = 0
-    for j in jobs:
-        if clear_all or status_filter:
-            if j.is_terminal() or status_filter:
-                eng.store.delete_job(j.id)
-                n += 1
+    n = skipped = 0
+    for j in eng.list_jobs(status=st):
+        if not j.is_terminal() and not force:
+            skipped += 1
+            continue
+        eng.store.delete_job(j.id)
+        n += 1
     console.print(f"[green]✓[/green] Cleared {n} job(s)")
+    if skipped:
+        console.print(f"[dim]Skipped {skipped} non-terminal job(s) — use --force to delete.[/dim]")
 
 
 @fleet_group.command("_run-worker", hidden=True)

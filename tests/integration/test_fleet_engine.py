@@ -158,6 +158,45 @@ def test_cancel_queued_job(engine):
     assert cancelled.status == JobStatus.CANCELLED
 
 
+def test_orchestrators_do_not_consume_worker_budget(tmp_path, monkeypatch):
+    # Regression: in-flight orchestrators (RUNNING, no process) must not eat the
+    # concurrency budget, or fan-outs deadlock.
+    profiles = [FakeProfile("a", tmp_path / "a")]
+    store = FleetStore(root=tmp_path / "fleet")
+    eng = FleetEngine(
+        store=store, profile_manager=FakePM(profiles), auth_manager=FakeAuth(), max_concurrent=2
+    )
+    monkeypatch.setattr("claudex.fleet.runner.spawn_detached", lambda s, j: 1)
+    # Two orchestrators sitting RUNNING (e.g. mid fan-out).
+    for _ in range(2):
+        o = Job(prompt="parent", is_orchestrator=True, status=JobStatus.RUNNING)
+        store.save_job(o)
+    # A real queued child should still be scheduled despite max_concurrent=2.
+    job = eng.dispatch("child", profile="a")
+    assert job.status == JobStatus.ASSIGNED
+
+
+def test_reconcile_dead_assigned_fails(engine, monkeypatch):
+    monkeypatch.setattr("claudex.fleet.runner.spawn_detached", lambda s, j: 2_000_000_000)
+    job = engine.dispatch("x", profile="a", auto_tick=False)
+    j = engine.store.load_job(job.id)
+    j.status = JobStatus.ASSIGNED
+    j.pid = 2_000_000_000  # dead, never reached RUNNING
+    engine.store.save_job(j)
+    engine.tick()
+    assert engine.store.load_job(job.id).status == JobStatus.FAILED
+
+
+def test_cancel_cascades_to_children(engine, monkeypatch):
+    # Use a dead pid so cancel doesn't try to signal a real process.
+    monkeypatch.setattr("claudex.fleet.runner.spawn_detached", lambda s, j: 2_000_000_000)
+    parent = engine.fan_out("p", ["s1", "s2"])
+    engine.cancel(parent.id)
+    assert engine.store.load_job(parent.id).status == JobStatus.CANCELLED
+    for cid in parent.child_ids:
+        assert engine.store.load_job(cid).status == JobStatus.CANCELLED
+
+
 # ── real worker with a fake `claude` binary ─────────────────────────────────
 @pytest.fixture
 def fake_claude(tmp_path, monkeypatch):

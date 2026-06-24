@@ -98,6 +98,7 @@ class FleetStore:
         self.results_dir = self.root / "results"
         for d in (self.jobs_dir, self.logs_dir, self.results_dir):
             d.mkdir(parents=True, exist_ok=True)
+        self._lock_depth = 0  # makes self.lock() reentrant within one instance
 
     # ── paths ────────────────────────────────────────────────────────────────
     def job_path(self, job_id: str) -> Path:
@@ -123,8 +124,23 @@ class FleetStore:
     # ── locking ──────────────────────────────────────────────────────────────
     @contextmanager
     def lock(self) -> Iterator[None]:
+        # OS file locks (flock/msvcrt) are per-open-fd and NOT reentrant: a nested
+        # lock() on a fresh fd would block on the process's own lock. Guard with a
+        # depth counter so nested transitions (e.g. compare_and_claim under lock())
+        # don't deadlock.
+        if self._lock_depth > 0:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
         with _file_lock(self.lock_path):
-            yield
+            self._lock_depth = 1
+            try:
+                yield
+            finally:
+                self._lock_depth = 0
 
     @contextmanager
     def refresh_lock(self, profile: str) -> Iterator[None]:
@@ -209,6 +225,20 @@ class FleetStore:
                 job.attempts += 1
             self.save_job(job)
             return job
+
+    def attach_pid(self, job_id: str, pid: int) -> None:
+        """Record the worker pid, but only if the job is still ASSIGNED.
+
+        The detached worker may already have advanced the job to RUNNING (or a
+        terminal state) for a fast job; in that case we must not write a stale
+        snapshot over it. Guarded by the global lock.
+        """
+        with self.lock():
+            job = self.load_job(job_id)
+            if job is None or job.status != JobStatus.ASSIGNED:
+                return
+            job.pid = pid
+            self.save_job(job)
 
     # ── results ────────────────────────────────────────────────────────────--
     def save_result(self, result: JobResult) -> None:

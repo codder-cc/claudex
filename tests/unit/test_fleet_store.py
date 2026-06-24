@@ -95,6 +95,31 @@ def test_cooldowns_round_trip(store):
     assert loaded["work"].in_cooldown(datetime(2029, 1, 1, tzinfo=timezone.utc))
 
 
+def test_attach_pid_only_when_assigned(store):
+    job = Job(prompt="x", status=JobStatus.ASSIGNED)
+    store.save_job(job)
+    store.attach_pid(job.id, 4242)
+    assert store.load_job(job.id).pid == 4242
+    # If the worker already advanced the job, attach_pid must be a no-op.
+    running = store.load_job(job.id)
+    running.status = JobStatus.RUNNING
+    running.pid = 999
+    store.save_job(running)
+    store.attach_pid(job.id, 4242)
+    after = store.load_job(job.id)
+    assert after.status == JobStatus.RUNNING
+    assert after.pid == 999  # not clobbered back to the dispatcher's pid
+
+
+def test_lock_is_reentrant(store):
+    # Nested lock() must not deadlock (OS file locks are not reentrant by default).
+    with store.lock():
+        with store.lock():
+            job = Job(prompt="x")
+            store.save_job(job)
+    assert store.load_job(job.id) is not None
+
+
 def test_delete_job_removes_artifacts(store):
     job = Job(prompt="x")
     store.save_job(job)

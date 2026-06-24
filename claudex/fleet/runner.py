@@ -144,13 +144,11 @@ def run_worker(job_id: str, store: Optional[FleetStore] = None) -> int:
     store.save_job(job)
 
     if not job.profile:
-        _finalize(store, job, JobStatus.FAILED, FAIL_ERROR, "no profile assigned")
-        return 1
+        return _fail_terminal(store, job, "no profile assigned")
     try:
         profile = pm.get(job.profile)
     except Exception as e:
-        _finalize(store, job, JobStatus.FAILED, FAIL_ERROR, f"profile load failed: {e}")
-        return 1
+        return _fail_terminal(store, job, f"profile load failed: {e}")
 
     env = build_claude_env(auth, job.profile, profile.config_dir)
     cwd = job.cwd if job.cwd and Path(job.cwd).is_dir() else os.getcwd()
@@ -168,8 +166,7 @@ def run_worker(job_id: str, store: Optional[FleetStore] = None) -> int:
         stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
     except FileNotFoundError:
-        _finalize(store, job, JobStatus.FAILED, FAIL_ERROR, "claude CLI not found in PATH")
-        return 1
+        return _fail_terminal(store, job, "claude CLI not found in PATH")
 
     # Tee captured output into the log (Popen already wrote nothing useful here).
     try:
@@ -202,6 +199,12 @@ def run_worker(job_id: str, store: Optional[FleetStore] = None) -> int:
         _finalize(store, job, JobStatus.FAILED, failure, msg)
 
     # Self-propelling drain: a finished worker frees a slot, so pull the next job.
+    _drain(store)
+    return 0
+
+
+def _drain(store: FleetStore) -> None:
+    """A finished worker frees a slot — pull the next queued job."""
     try:
         from claudex.fleet.engine import FleetEngine
 
@@ -209,7 +212,14 @@ def run_worker(job_id: str, store: Optional[FleetStore] = None) -> int:
     except Exception:
         pass
 
-    return 0
+
+def _fail_terminal(store: FleetStore, job: Job, msg: str) -> int:
+    """Finalize a job as FAILED, persist a result so `fleet result` shows the
+    error, and still drain the queue. Used for pre-launch terminal failures."""
+    store.save_result(JobResult(job_id=job.id, status=JobStatus.FAILED, error=msg))
+    _finalize(store, job, JobStatus.FAILED, FAIL_ERROR, msg)
+    _drain(store)
+    return 1
 
 
 def _finalize(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from rich.console import Console
@@ -124,6 +123,33 @@ def run_doctor() -> None:
                 break
     results.append(_check("JSONL session parsing", session_ok, session_detail,
                            "Sessions will appear after running claude in a profile" if not session_ok else ""))
+
+    # 9. macOS Keychain consistency: claudex reads .credentials.json/backend, but
+    #    Claude Code reads the Keychain. If they disagree, claudex shows authed
+    #    while Claude prompts to log in (the cross-machine share symptom).
+    from claudex.constants import IS_MACOS
+    if IS_MACOS and PROFILES_DIR.exists():
+        from claudex.core.auth import AuthManager
+        from claudex.core.profile import ProfileManager
+        am = AuthManager()
+        mismatched = []
+        for p in ProfileManager().list():
+            try:
+                st = am.get_status(p.name, p.config_dir)
+                if st.auth_type != "oauth":
+                    continue
+                if am.macos_keychain_token_present(p.config_dir) is False:
+                    mismatched.append(p.name)
+            except Exception:
+                continue
+        results.append(_check(
+            "macOS Keychain matches claudex auth",
+            not mismatched,
+            "all profiles consistent" if not mismatched
+            else f"missing Keychain token: {', '.join(mismatched)}",
+            "Run 'claudex auth import-current <name>' or 'claudex auth relogin <name>'"
+            if mismatched else "",
+        ))
 
     # Print results table
     table = Table(show_header=True, header_style="bold")
