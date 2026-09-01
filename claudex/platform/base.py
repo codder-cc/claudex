@@ -24,8 +24,14 @@ class CredentialBackend(ABC):
 
     def test(self) -> None:
         """Verify backend is functional. Raises on failure."""
-        self.store("__test__", "__test__", "ok")
-        val = self.retrieve("__test__", "__test__")
-        self.delete("__test__", "__test__")
+        try:
+            self.store("__test__", "__test__", "ok")
+            val = self.retrieve("__test__", "__test__")
+        finally:
+            # Always clean up the probe entry, even if the round-trip raised.
+            try:
+                self.delete("__test__", "__test__")
+            except Exception:
+                pass
         if val != "ok":
             raise RuntimeError("Credential backend round-trip failed")

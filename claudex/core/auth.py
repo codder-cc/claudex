@@ -105,7 +105,7 @@ class AuthManager:
 
         # Try reading directly from Claude's credential files if no stored creds
         if not token and auth_type_stored == "none":
-            auth_type_stored, email, expires_at, token = self._read_claude_creds(config_dir)
+            auth_type_stored, email, expires_at, token, _refresh = self._read_claude_creds(config_dir)
 
         preview = ""
         if token and len(token) > 16:
@@ -263,12 +263,9 @@ class AuthManager:
 
         if not access_token:
             # Fall back to reading from .credentials.json / OS Keychain
-            _, _, expires_dt, access_token = self._read_claude_creds(config_dir)
-            # _read_claude_creds stashes refresh into a temp key
-            tmp_refresh = self.backend.retrieve("_tmp_refresh", "refresh_token") or ""
-            if tmp_refresh:
-                refresh_token = tmp_refresh
-                self.backend.delete("_tmp_refresh", "refresh_token")
+            _, _, expires_dt, access_token, read_refresh = self._read_claude_creds(config_dir)
+            if read_refresh:
+                refresh_token = read_refresh
             if expires_dt and not expires_at_str:
                 expires_at_str = expires_dt.isoformat()
 
@@ -324,10 +321,9 @@ class AuthManager:
 
         if not access_token:
             # Fallback: use the standard reader
-            auth_type_fb, email_fb, expires_at_fb, access_token = self._read_claude_creds(config_dir)
-            refresh_token = self.backend.retrieve("_tmp_refresh", "refresh_token") or refresh_token
-            if refresh_token:
-                self.backend.delete("_tmp_refresh", "refresh_token")
+            auth_type_fb, email_fb, expires_at_fb, access_token, read_refresh = \
+                self._read_claude_creds(config_dir)
+            refresh_token = read_refresh or refresh_token
             expires_ms = expires_at_fb.timestamp() * 1000 if expires_at_fb else None
         else:
             auth_type_fb = "oauth" if access_token.startswith("sk-ant-oat") else "api_key"
@@ -336,8 +332,6 @@ class AuthManager:
             if isinstance(expires_ms, (int, float)):
                 from datetime import datetime, timezone
                 expires_at_fb = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
-            # Drain any stale temp key
-            self.backend.delete("_tmp_refresh", "refresh_token")
 
         if not access_token:
             return False
@@ -505,7 +499,7 @@ class AuthManager:
 
     def _import_claude_credentials(self, profile_name: str, config_dir: Path) -> None:
         """Read credentials Claude wrote during /login and store them in our backend."""
-        auth_type, email, expires_at, token = self._read_claude_creds(config_dir)
+        auth_type, email, expires_at, token, refresh = self._read_claude_creds(config_dir)
         if token:
             self.backend.store(profile_name, "oauth_token", token)
         if auth_type != "none":
@@ -514,16 +508,19 @@ class AuthManager:
             self.backend.store(profile_name, "email", email)
         if expires_at:
             self.backend.store(profile_name, "expires_at", expires_at.isoformat())
-        # Move temp refresh token if it was stashed during _read_claude_creds
-        refresh = self.backend.retrieve("_tmp_refresh", "refresh_token")
         if refresh:
             self.backend.store(profile_name, "refresh_token", refresh)
-            self.backend.delete("_tmp_refresh", "refresh_token")
 
     def _read_claude_creds(
         self, config_dir: Path
-    ) -> tuple[str, str, Optional[datetime], str]:
-        """Try to read Claude's stored credentials from its config dir."""
+    ) -> tuple[str, str, Optional[datetime], str, str]:
+        """Try to read Claude's stored credentials from its config dir.
+
+        Returns ``(auth_type, email, expires_at, access_token, refresh_token)``.
+        The refresh token is returned directly rather than stashed in shared
+        backend state, so concurrent reads for different profiles can't leak each
+        other's refresh tokens.
+        """
         candidates = [
             config_dir / ".credentials.json",
             config_dir / "credentials.json",
@@ -547,10 +544,7 @@ class AuthManager:
                         expires_at = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
                     email = data.get("emailAddress", "")
                     auth_type = "oauth" if token.startswith("sk-ant-oat") else "api_key"
-                    # Also store refresh token
-                    if refresh:
-                        self.backend.store("_tmp_refresh", "refresh_token", refresh)
-                    return auth_type, email, expires_at, token
+                    return auth_type, email, expires_at, token, refresh
 
                 # Flat format fallback: {"accessToken": ..., "oauthToken": ...}
                 token = data.get("accessToken") or data.get("oauthToken", "")
@@ -567,7 +561,7 @@ class AuthManager:
                 auth_type = "oauth" if token and token.startswith("sk-ant-oat") else \
                             "api_key" if token and token.startswith("sk-ant-") else "none"
                 if token:
-                    return auth_type, email, expires_at, token
+                    return auth_type, email, expires_at, token, ""
             except Exception:
                 continue
 
@@ -596,15 +590,15 @@ class AuthManager:
                     email = oauth_account.get("emailAddress", "")
                     billing = oauth_account.get("billingType", "")
                     auth_type = "api_key" if billing == "api_key" else "oauth"
-                    return auth_type, email, None, ""
+                    return auth_type, email, None, "", ""
             except Exception:
                 pass
 
-        return "none", "", None, ""
+        return "none", "", None, "", ""
 
     def _read_macos_keychain(
         self, config_dir: Path
-    ) -> Optional[tuple[str, str, Optional[datetime], str]]:
+    ) -> Optional[tuple[str, str, Optional[datetime], str, str]]:
         """Read Claude Code's OAuth token from the macOS Keychain.
 
         Claude Code stores credentials under the service name:
@@ -652,16 +646,14 @@ class AuthManager:
                     except Exception:
                         pass
                 auth_type = "oauth" if token.startswith("sk-ant-oat") else "api_key"
-                if refresh:
-                    self.backend.store("_tmp_refresh", "refresh_token", refresh)
-                return auth_type, email, expires_at, token
+                return auth_type, email, expires_at, token, refresh
             except Exception:
                 continue
         return None
 
     def _read_windows_credential_manager(
         self, config_dir: Path
-    ) -> Optional[tuple[str, str, Optional[datetime], str]]:
+    ) -> Optional[tuple[str, str, Optional[datetime], str, str]]:
         """Read Claude Code's OAuth token from the Windows Credential Manager.
 
         Claude Code (via keytar) stores credentials with a TargetName of:
@@ -744,9 +736,7 @@ class AuthManager:
                     except Exception:
                         pass
                 auth_type = "oauth" if token.startswith("sk-ant-oat") else "api_key"
-                if refresh:
-                    self.backend.store("_tmp_refresh", "refresh_token", refresh)
-                return auth_type, email, expires_at, token
+                return auth_type, email, expires_at, token, refresh
             except Exception:
                 continue
             finally:

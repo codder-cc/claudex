@@ -23,9 +23,15 @@ class KeyringBackend(CredentialBackend):
         try:
             keyring.delete_password(CREDENTIAL_SERVICE, self._key(profile, key))
         except keyring.errors.PasswordDeleteError:
+            pass  # key not present — already gone
+        except keyring.errors.KeyringError:
+            # A backend hiccup (locked keyring, transient error) must not abort a
+            # multi-key revoke partway through and leave credentials half-deleted.
             pass
 
     def list_keys(self, profile: str) -> list[str]:
-        # keyring has no list API; return known key types
-        known = ["oauth_token", "refresh_token", "api_key", "email", "expires_at"]
+        # keyring has no list API; probe the full set of keys claudex ever stores
+        # (must stay in sync with AuthManager.revoke so deletes don't orphan keys).
+        known = ["oauth_token", "refresh_token", "api_key", "auth_type",
+                 "email", "expires_at"]
         return [k for k in known if self.retrieve(profile, k) is not None]
