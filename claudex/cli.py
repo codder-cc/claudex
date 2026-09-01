@@ -197,7 +197,7 @@ def list_profiles() -> None:
     table.add_column("Expires")
 
     for p in profiles:
-        is_active = active == p.name or str(p.config_dir) in active
+        is_active = active == p.name or active == str(p.config_dir)
         marker = "▶" if is_active else " "
         try:
             status = am.get_status(p.name, p.config_dir)
@@ -264,11 +264,25 @@ def switch_profile(name: str) -> None:
         sys.exit(1)
 
 
-@cli.command("use")
+@cli.command("use", context_settings={"ignore_unknown_options": True})
 @click.argument("name")
-@click.argument("claude_args", nargs=-1)
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def use_profile(name: str, claude_args: tuple) -> None:
-    """Launch claude with a specific profile (one-shot, does not persist)."""
+    """Launch claude with a specific profile (one-shot, does not persist).
+
+    Any extra arguments are passed straight through to `claude`, so profile
+    flags and claude flags can be mixed freely:
+
+    \b
+      claudex use work --continue --dangerously-skip-permissions
+      claudex use work -p "summarise this repo"
+      claudex use work --model claude-opus-4-8
+
+    If an argument would otherwise be captured by claudex, separate it with --:
+
+    \b
+      claudex use work -- --help      # shows claude's help, not claudex's
+    """
     try:
         pm = _pm()
         am = _auth()
@@ -276,9 +290,11 @@ def use_profile(name: str, claude_args: tuple) -> None:
         env = {**os.environ, **am.get_env_for_profile(name, profile.config_dir)}
         cmd = [CLAUDE_BIN] + list(claude_args)
         if sys.platform != "win32":
-            os.execvpe(cmd[0], cmd, env)
+            os.execvpe(cmd[0], cmd, env)  # replace this process (Unix)
         else:
-            subprocess.run(cmd, env=env)
+            # No execvpe on Windows — run as a child and propagate its exit code.
+            result = subprocess.run(cmd, env=env)
+            sys.exit(result.returncode)
     except ClaudexError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
@@ -341,8 +357,12 @@ def import_profile(file: str) -> None:
     """Import a profile from a tar.gz export."""
     try:
         src = Path(file)
+        from claudex.core.profile_bundle import safe_extract
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        # `export` writes arcnames relative to PROFILES_DIR (e.g. "work/..."), so
+        # extract into PROFILES_DIR. safe_extract rejects traversal/symlink members.
         with tarfile.open(src, "r:gz") as tar:
-            tar.extractall(path=PROFILES_DIR.parent)
+            safe_extract(tar, PROFILES_DIR)
         console.print(f"[green]✓[/green] Imported from {src}")
         console.print("  Run 'claudex list' to see the imported profile.")
     except Exception as e:
@@ -403,7 +423,11 @@ def auth_status(profile_name: Optional[str]) -> None:
     """Show auth status for all profiles, or a specific one."""
     pm = _pm()
     am = _auth()
-    profiles = [pm.get(profile_name)] if profile_name else pm.list()
+    try:
+        profiles = [pm.get(profile_name)] if profile_name else pm.list()
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
     if not profiles:
         console.print("[yellow]No profiles found.[/yellow]")
         return
@@ -525,6 +549,11 @@ def auth_refresh(name: str) -> None:
 @click.confirmation_option(prompt="Revoke auth credentials for this profile?")
 def auth_revoke(name: str) -> None:
     """Revoke/clear stored credentials for a profile."""
+    pm = _pm()
+    if not pm.exists(name):
+        console.print(f"[red]Error:[/red] Profile '{name}' not found. "
+                      "Run 'claudex list' to see available profiles.")
+        sys.exit(1)
     _auth().revoke(name)
     console.print(f"[green]✓[/green] Credentials cleared for '{name}'")
 
@@ -568,7 +597,11 @@ def session_group() -> None:
 def session_list(name: Optional[str], limit: int, full_id: bool) -> None:
     """List sessions across all profiles (or filter by profile name)."""
     pm = _pm()
-    profiles = [pm.get(name)] if name else pm.list()
+    try:
+        profiles = [pm.get(name)] if name else pm.list()
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
     from claudex.history.browser import HistoryBrowser
     browser = HistoryBrowser(profiles)
     sessions = browser.get_all_sessions(profile_filter=name, limit=limit)
@@ -668,22 +701,27 @@ def session_resume(name: Optional[str], from_profile: Optional[str], session_id:
 def session_migrate(session_id: str, from_profile: str, to_profile: str) -> None:
     """Migrate a session from one profile to another."""
     pm = _pm()
-    am = _auth()
     from claudex.history.browser import HistoryBrowser
-    from claudex.history.parser import iter_sessions
-    profiles = pm.list()
-    browser = HistoryBrowser(profiles)
-    # Find session
-    session = next(
-        (s for s in browser.get_all_sessions(profile_filter=from_profile)
-         if s.session_id.startswith(session_id)),
-        None,
-    )
-    if not session:
-        console.print(f"[red]Session '{session_id}' not found in profile '{from_profile}'[/red]")
+    try:
+        profiles = pm.list()
+        browser = HistoryBrowser(profiles)
+        # Find session — prefer an exact id, then a unique prefix.
+        candidates = [s for s in browser.get_all_sessions(profile_filter=from_profile)
+                      if s.session_id == session_id or s.session_id.startswith(session_id)]
+        exact = [s for s in candidates if s.session_id == session_id]
+        candidates = exact or candidates
+        if not candidates:
+            console.print(f"[red]Session '{session_id}' not found in profile '{from_profile}'[/red]")
+            sys.exit(1)
+        if len(candidates) > 1:
+            console.print(f"[red]Ambiguous session id '{session_id}'[/red] — matches "
+                          f"{len(candidates)} sessions. Use a longer id (try --full-id).")
+            sys.exit(1)
+        to_prof = pm.get(to_profile)
+        new_session = browser.migrate_session(candidates[0], to_profile, to_prof.config_dir)
+    except (ClaudexError, FileExistsError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
-    to_prof = pm.get(to_profile)
-    new_session = browser.migrate_session(session, to_profile, to_prof.config_dir)
     console.print(f"[green]✓[/green] Session migrated to profile '{to_profile}'")
     console.print(f"  New path: {new_session.file_path}")
 
@@ -694,9 +732,20 @@ def session_migrate(session_id: str, from_profile: str, to_profile: str) -> None
 @click.option("--profile", "-p", default=None)
 @click.option("--limit", "-n", default=20)
 def history_cmd(profile: Optional[str], limit: int) -> None:
-    """Browse session history (opens TUI). Use --profile to filter."""
-    from claudex.tui.app import run_app
-    run_app()
+    """Browse session history.
+
+    With no options this opens the interactive TUI. When --profile or --limit is
+    given, a non-interactive table is printed instead (the TUI can't be
+    pre-filtered from the CLI).
+    """
+    # No filters → interactive browser.
+    if profile is None and limit == 20:
+        from claudex.tui.app import run_app
+        run_app()
+        return
+    # Filters given → render the same table as `session list` so the flags work.
+    ctx = click.get_current_context()
+    ctx.invoke(session_list, name=profile, limit=limit, full_id=False)
 
 
 @cli.command("search")
@@ -706,7 +755,12 @@ def search_cmd(query: str, profile: Optional[str]) -> None:
     """Search session history."""
     pm = _pm()
     from claudex.history.browser import HistoryBrowser
-    browser = HistoryBrowser(pm.list())
+    try:
+        profiles = [pm.get(profile)] if profile else pm.list()
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    browser = HistoryBrowser(profiles)
     results = browser.search(query, profile_filter=profile)
     if not results:
         console.print(f"[yellow]No sessions matching '{query}'[/yellow]")
@@ -923,7 +977,9 @@ def share_push(profile_name: str, label: Optional[str], expires_days: Optional[i
         sys.exit(1)
 
     # Generate key + encrypt bundle, build cx_ token — all client-side before upload.
-    # The token embeds the AES key which never touches the server.
+    # NOTE: the cx_ token (which embeds the AES key) is uploaded below so that
+    # `share pull <label>` works without copy-pasting the token. This is a
+    # convenience trade-off, not zero-knowledge — see claudex/crypto.py.
     aes_key = generate_key()
     ciphertext = encrypt(aes_key, bundle_bytes)
     ciphertext_b64 = base64.b64encode(ciphertext).decode("ascii")
@@ -1289,6 +1345,11 @@ def mcp_setup(profile_name: str, endpoint: Optional[str], fleet: bool,
         },
     }
     mcp_path.write_text(_json.dumps(mcp_config, indent=2) + "\n", encoding="utf-8")
+    # This file now holds a bearer token — restrict it to the owner.
+    try:
+        mcp_path.chmod(0o600)
+    except OSError:
+        pass
 
     console.print(f"[green]✓[/green] MCP server [bold]{server_name}[/bold] registered in profile [bold]{profile_name}[/bold]")
     console.print(f"  URL: {mcp_url}")
@@ -1487,14 +1548,19 @@ def fleet_logs(job_id, follow) -> None:
         console.print(path.read_text(encoding="utf-8", errors="replace"))
         return
     import time
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        console.print(f.read(), end="")
-        while True:
-            line = f.readline()
-            if line:
-                console.print(line, end="")
-            else:
-                time.sleep(0.5)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            sys.stdout.write(f.read())
+            sys.stdout.flush()
+            while True:
+                line = f.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                else:
+                    time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
 
 
 @fleet_group.command("cancel")

@@ -96,7 +96,10 @@ def run_doctor() -> None:
     from claudex.constants import ACTIVE_PROFILE_FILE
     active = ""
     if ACTIVE_PROFILE_FILE.exists():
-        active = ACTIVE_PROFILE_FILE.read_text().strip()
+        try:
+            active = ACTIVE_PROFILE_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            active = ""
     results.append(_check(
         "active profile",
         bool(active),
@@ -107,11 +110,15 @@ def run_doctor() -> None:
     # 8. Parse a session file
     session_ok = False
     session_detail = "no sessions found"
+    found_any = False
     if PROFILES_DIR.exists():
+        from claudex.history.parser import parse_session_file
         for profile_dir in PROFILES_DIR.iterdir():
-            for jsonl in profile_dir.rglob("*.jsonl"):
+            # Match the real parser layout (projects/<encoded>/<uuid>.jsonl) rather
+            # than an unbounded rglob, so PASS/FAIL reflects what's actually read.
+            for jsonl in (profile_dir / "projects").glob("*/*.jsonl"):
+                found_any = True
                 try:
-                    from claudex.history.parser import parse_session_file
                     s = parse_session_file(jsonl, profile_dir.name)
                     if s:
                         session_ok = True
@@ -121,6 +128,10 @@ def run_doctor() -> None:
                     session_detail = f"parse error: {e}"
             if session_ok:
                 break
+    # No sessions at all isn't a failure — only a real parse failure is.
+    if not found_any:
+        session_ok = True
+        session_detail = "no sessions yet"
     results.append(_check("JSONL session parsing", session_ok, session_detail,
                            "Sessions will appear after running claude in a profile" if not session_ok else ""))
 
@@ -166,3 +177,6 @@ def run_doctor() -> None:
         console.print("\n[green bold]All checks passed![/green bold]\n")
     else:
         console.print(f"\n[red bold]{fails} check(s) failed.[/red bold] See 'Fix' column above.\n")
+    # Non-zero exit so `claudex doctor` is usable as a CI / scripting health gate.
+    import sys
+    sys.exit(1 if fails else 0)
