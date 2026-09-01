@@ -41,26 +41,35 @@ class HistoryBrowser:
         query: str,
         profile_filter: Optional[str] = None,
     ) -> list[Session]:
+        # Parse the corpus once — transcripts can be hundreds of MB, so re-listing
+        # per match strategy is wasteful and was a real performance bug.
+        all_sessions = self.get_all_sessions(profile_filter=profile_filter)
         query_lower = query.lower()
-        results = []
-        for s in self.get_all_sessions(profile_filter=profile_filter):
+        results: list[Session] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(s: Session) -> None:
+            key = (s.profile_name, s.session_id)
+            if key not in seen:
+                seen.add(key)
+                results.append(s)
+
+        for s in all_sessions:
             if (
                 query_lower in s.title.lower()
                 or query_lower in str(s.project_path).lower()
                 or query_lower in s.session_id.lower()
             ):
-                results.append(s)
-        # Optionally use rapidfuzz for fuzzy matching
+                _add(s)
+
+        # Optionally augment with rapidfuzz fuzzy title matching.
         try:
             from rapidfuzz import fuzz, process
-            all_sessions = self.get_all_sessions(profile_filter=profile_filter)
             titles = [s.title for s in all_sessions]
             fuzzy_matches = process.extract(query, titles, scorer=fuzz.partial_ratio, limit=20)
-            matched_ids = {m[2] for m in fuzzy_matches if m[1] > 50}
-            for i in matched_ids:
-                s = all_sessions[i]
-                if s not in results:
-                    results.append(s)
+            for _title, score, idx in fuzzy_matches:
+                if score > 50:
+                    _add(all_sessions[idx])
         except ImportError:
             pass
         return results
@@ -71,9 +80,18 @@ class HistoryBrowser:
 
     def migrate_session(self, session: Session, to_profile_name: str, to_config_dir: Path) -> Session:
         """Copy a session JSONL file from one profile to another."""
+        if session.profile_name == to_profile_name:
+            raise ValueError("Source and destination profiles are the same.")
         dest_projects = to_config_dir / "projects" / session.file_path.parent.name
         dest_projects.mkdir(parents=True, exist_ok=True)
         dest_file = dest_projects / session.file_path.name
+        if dest_file.resolve() == session.file_path.resolve():
+            raise ValueError("Source and destination paths are identical.")
+        if dest_file.exists():
+            raise FileExistsError(
+                f"A session '{session.session_id}' already exists in profile "
+                f"'{to_profile_name}'."
+            )
         shutil.copy2(str(session.file_path), str(dest_file))
         from claudex.history.parser import parse_session_file
         new_session = parse_session_file(dest_file, to_profile_name)

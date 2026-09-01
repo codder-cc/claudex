@@ -16,6 +16,11 @@ def decode_project_path(encoded: str) -> Path:
     Decode Claude Code's project path encoding from directory names.
     Claude encodes '/' as '-' in path components (observed behaviour).
     Falls back to URL decode, then raw string.
+
+    NOTE: this is inherently lossy — a directory whose real name contains a
+    hyphen is indistinguishable from a path separator. Callers should prefer the
+    ``cwd`` field embedded in the transcript when it is available; this is only a
+    best-effort fallback for display.
     """
     # Common pattern: /home/user/dev/project → -home-user-dev-project
     # or URL encoded: %2Fhome%2Fuser%2Fdev%2Fproject
@@ -30,47 +35,71 @@ def decode_project_path(encoded: str) -> Path:
 
 
 def _parse_timestamp(value) -> Optional[datetime]:
+    """Parse a timestamp into a *naive local* datetime.
+
+    Claude transcripts mix epoch-millisecond ints, ISO strings with a ``Z``/offset
+    (timezone-aware), and ISO strings with no zone. We normalise everything to a
+    single naive-local representation so that sorting and ``datetime.now()`` deltas
+    never raise "can't compare offset-naive and offset-aware datetimes".
+    """
     if not value:
+        return None
+    dt: Optional[datetime] = None
+    if isinstance(value, bool):  # bool is an int subclass; reject it explicitly
         return None
     if isinstance(value, (int, float)):
         try:
-            return datetime.fromtimestamp(value / 1000)
-        except Exception:
+            dt = datetime.fromtimestamp(value / 1000)  # naive local
+        except (ValueError, OSError, OverflowError):
             return None
-    if isinstance(value, str):
-        for fmt in [
-            lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")),
-            lambda s: datetime.fromisoformat(s),
-        ]:
+    elif isinstance(value, str):
+        for fmt in (lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")),
+                    datetime.fromisoformat):
             try:
-                return fmt(value)
-            except Exception:
+                dt = fmt(value)
+                break
+            except (ValueError, TypeError):
                 continue
-    return None
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)  # → naive local
+    return dt
 
 
 def _extract_text(content) -> str:
-    """Extract text from various Claude content formats."""
+    """Extract a short title string from various Claude content formats."""
     if isinstance(content, str):
         return content[:200]
     if isinstance(content, list):
         for block in content:
-            if isinstance(block, dict):
-                t = block.get("type", "")
-                if t == "text":
-                    return block.get("text", "")[:200]
+            if isinstance(block, dict) and block.get("type", "") == "text":
+                text = block.get("text", "")
+                if isinstance(text, str):
+                    return text[:200]
     if isinstance(content, dict):
-        return content.get("text", str(content))[:200]
+        text = content.get("text")
+        return (text if isinstance(text, str) else str(content))[:200]
     return str(content)[:200]
+
+
+def _safe_int(value) -> int:
+    """Coerce a usage field to int, tolerating None / strings / junk."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_usage(data: dict) -> TokenUsage:
     usage = data.get("usage") or data.get("token_usage") or {}
+    if not isinstance(usage, dict):
+        return TokenUsage()
     return TokenUsage(
-        input_tokens=int(usage.get("input_tokens", 0)),
-        output_tokens=int(usage.get("output_tokens", 0)),
-        cache_read=int(usage.get("cache_read_input_tokens", 0)),
-        cache_write=int(usage.get("cache_creation_input_tokens", 0)),
+        input_tokens=_safe_int(usage.get("input_tokens", 0)),
+        output_tokens=_safe_int(usage.get("output_tokens", 0)),
+        cache_read=_safe_int(usage.get("cache_read_input_tokens", 0)),
+        cache_write=_safe_int(usage.get("cache_creation_input_tokens", 0)),
     )
 
 
@@ -80,11 +109,12 @@ def parse_session_file(path: Path, profile_name: str) -> Optional[Session]:
     Defensive: never crashes on malformed input.
     """
     session_id = path.stem
-    project_path = decode_project_path(path.parent.name)
 
     total_tokens = TokenUsage()
     message_count = 0
     title = "(untitled)"
+    cwd: Optional[str] = None
+    ai_title: Optional[str] = None
     started_at: Optional[datetime] = None
     last_active: Optional[datetime] = None
     found_first_user = False
@@ -97,11 +127,17 @@ def parse_session_file(path: Path, profile_name: str) -> Optional[Session]:
                     continue
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     continue
 
                 if not isinstance(obj, dict):
                     continue
+
+                # Prefer Claude's own recorded cwd / title over reconstructions.
+                if cwd is None and isinstance(obj.get("cwd"), str):
+                    cwd = obj["cwd"]
+                if ai_title is None and isinstance(obj.get("aiTitle"), str):
+                    ai_title = obj["aiTitle"]
 
                 # Handle both flat message and wrapped event formats
                 msg = obj
@@ -140,6 +176,13 @@ def parse_session_file(path: Path, profile_name: str) -> Optional[Session]:
     if message_count == 0:
         return None
 
+    # cwd from the transcript is authoritative; decode_project_path is the lossy
+    # fallback only when the field is absent. A Claude-generated aiTitle beats the
+    # truncated first user message.
+    project_path = Path(cwd) if cwd else decode_project_path(path.parent.name)
+    if ai_title:
+        title = ai_title[:80]
+
     now = datetime.now()
     return Session(
         session_id=session_id,
@@ -159,10 +202,20 @@ def iter_sessions(config_dir: Path, profile_name: str) -> Iterator[Session]:
     projects_dir = config_dir / "projects"
     if not projects_dir.exists():
         return
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
     for encoded_project in sorted(projects_dir.iterdir()):
         if not encoded_project.is_dir():
             continue
-        for jsonl_file in sorted(encoded_project.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
-            session = parse_session_file(jsonl_file, profile_name)
+        for jsonl_file in sorted(encoded_project.glob("*.jsonl"), key=_mtime, reverse=True):
+            try:
+                session = parse_session_file(jsonl_file, profile_name)
+            except Exception:
+                # One unparseable transcript must never abort the whole listing.
+                continue
             if session:
                 yield session

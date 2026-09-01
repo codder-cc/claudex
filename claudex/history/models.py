@@ -50,11 +50,17 @@ class Session:
 
     @property
     def age_human(self) -> str:
+        # The parser normalises timestamps to naive-local, but be defensive: if an
+        # aware datetime ever reaches here, strip the zone so the subtraction below
+        # can't raise "can't subtract offset-naive and offset-aware datetimes".
+        last_active = self.last_active
+        if last_active.tzinfo is not None:
+            last_active = last_active.astimezone().replace(tzinfo=None)
         try:
             import humanize
-            return humanize.naturaltime(self.last_active)
+            return humanize.naturaltime(last_active)
         except ImportError:
-            delta = datetime.now() - self.last_active
+            delta = datetime.now() - last_active
             hours = int(delta.total_seconds() // 3600)
             if hours < 1:
                 return "just now"

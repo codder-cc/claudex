@@ -27,10 +27,19 @@ class SessionManager:
         return self._history.get_last_session(profile_name)
 
     def find_by_id(self, session_id: str) -> Optional[Session]:
-        """Find a session by ID (or prefix) across all profiles."""
-        for s in self._history.get_all_sessions():
-            if s.session_id == session_id or s.session_id.startswith(session_id):
+        """Find a session by exact ID, falling back to a unique prefix match.
+
+        An exact match always wins. A prefix is only accepted when it resolves to
+        exactly one session, so an ambiguous prefix never silently resumes the
+        wrong conversation.
+        """
+        sessions = self._history.get_all_sessions()
+        for s in sessions:
+            if s.session_id == session_id:
                 return s
+        prefix_matches = [s for s in sessions if s.session_id.startswith(session_id)]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
         return None
 
     def resume(
@@ -82,7 +91,11 @@ class SessionManager:
         if sys.platform != "win32":
             os.execvpe(cmd[0], cmd, env)  # Replace current process (Unix)
         else:
-            subprocess.run(cmd, env=env)
+            # No execvpe on Windows — run as a child and propagate its exit code
+            # so `claudex` doesn't report success when claude failed.
+            result = subprocess.run(cmd, env=env)
+            if result.returncode != 0:
+                sys.exit(result.returncode)
 
     def _claude_available(self) -> bool:
         import shutil
