@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import shutil
 from dataclasses import dataclass, field, asdict
@@ -15,35 +16,36 @@ from claudex.constants import (
     CURRENT_ENV_BASH, CURRENT_ENV_PWSH, CLAUDE_CONFIG_DIR_ENV,
     SHAREABLE_RESOURCES, IS_WINDOWS,
 )
-from claudex.exceptions import ProfileNotFoundError, ProfileExistsError
+from claudex.exceptions import ProfileNotFoundError, ProfileExistsError, ClaudexError
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib  # type: ignore[no-reuse-import]
 
+import tomli_w
+
+# A profile name becomes a single filesystem path component AND is interpolated
+# into generated shell snippets, so it must be a strict, shell-safe slug. This
+# blocks path traversal (``/`` ``\`` ``..``) and shell metacharacters (``;`` ``$``
+# ``` ` ``` etc.) that would otherwise execute when ~/.bashrc is sourced.
+_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+
+
+def validate_profile_name(name: str) -> str:
+    """Return *name* if it is a safe profile slug, else raise ClaudexError."""
+    if not name or not _NAME_RE.match(name) or name in (".", "..") or len(name) > 64:
+        raise ClaudexError(
+            f"Invalid profile name {name!r}. Use letters, digits, '.', '_' or '-' "
+            "(must start with a letter, digit or underscore; max 64 chars)."
+        )
+    return name
+
 
 def _write_toml(data: dict, path: Path) -> None:
-    lines = []
-    for key, value in data.items():
-        lines.append(f"{key} = {_toml_val(value)}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _toml_val(v) -> str:
-    if v is None:
-        return '""'
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, str):
-        # Use forward slashes to avoid TOML escape issues on Windows
-        safe = v.replace("\\", "/")
-        return f'"{safe}"'
-    if isinstance(v, list):
-        return "[" + ", ".join(_toml_val(i) for i in v) + "]"
-    if isinstance(v, datetime):
-        return f'"{v.isoformat()}"'
-    return str(v)
+    # tomli_w handles escaping of quotes/backslashes/control chars correctly,
+    # which a hand-rolled serialiser does not.
+    path.write_text(tomli_w.dumps(data), encoding="utf-8")
 
 
 @dataclass
@@ -104,6 +106,7 @@ class ProfileManager:
         color: str = "cyan",
         notes: str = "",
     ) -> Profile:
+        validate_profile_name(name)
         if self.exists(name):
             raise ProfileExistsError(name)
         config_dir = PROFILES_DIR / name
@@ -159,6 +162,9 @@ class ProfileManager:
         return os.environ.get(CLAUDE_CONFIG_DIR_ENV, "")
 
     def set_active(self, name: str) -> None:
+        # Validate so a malicious value (e.g. from a repo-local .claudeprofile fed
+        # through the auto-switch hook) can never reach the filesystem layer.
+        validate_profile_name(name)
         profile = self.get(name)
         ACTIVE_PROFILE_FILE.write_text(name, encoding="utf-8")
         # Update last_used
@@ -169,15 +175,17 @@ class ProfileManager:
 
     def _write_env_files(self, config_dir: Path) -> None:
         """Write .current_env and .current_env.ps1 for shell functions to source."""
+        import shlex
         CLAUDEX_HOME.mkdir(parents=True, exist_ok=True)
-        # Bash / Zsh
+        # Bash / Zsh — POSIX-quote the path in case home contains spaces/quotes.
         CURRENT_ENV_BASH.write_text(
-            f'export {CLAUDE_CONFIG_DIR_ENV}="{config_dir}"\n',
+            f'export {CLAUDE_CONFIG_DIR_ENV}={shlex.quote(str(config_dir))}\n',
             encoding="utf-8",
         )
-        # PowerShell
+        # PowerShell — single-quote (no interpolation; double embedded quotes).
+        ps_path = "'" + str(config_dir).replace("'", "''") + "'"
         CURRENT_ENV_PWSH.write_text(
-            f'$env:{CLAUDE_CONFIG_DIR_ENV} = "{config_dir}"\n',
+            f'$env:{CLAUDE_CONFIG_DIR_ENV} = {ps_path}\n',
             encoding="utf-8",
         )
 
@@ -185,6 +193,7 @@ class ProfileManager:
         return self.get(name).config_dir
 
     def rename(self, old_name: str, new_name: str) -> Profile:
+        validate_profile_name(new_name)
         if not self.exists(old_name):
             raise ProfileNotFoundError(old_name)
         if self.exists(new_name):
@@ -196,6 +205,10 @@ class ProfileManager:
         profile.name = new_name
         profile.config_dir = new_dir
         profile.save()
+        # If the renamed profile was the active one, repoint the active marker
+        # and the sourced env files so switch/resume keep working.
+        if self.get_active() == old_name:
+            self.set_active(new_name)
         return profile
 
     def set_resource_isolation(
@@ -212,10 +225,11 @@ class ProfileManager:
         if shared:
             # Create symlink in profile dir pointing to shared
             if target.exists() and not target.is_symlink():
-                # Move existing to shared if shared doesn't exist yet
+                # Seed the shared copy from this profile's real data if it doesn't
+                # exist yet, so toggling never silently discards the user's files.
                 if not shared_src.exists():
-                    shutil.copy2(str(target), str(shared_src))
-                target.unlink() if target.is_file() else shutil.rmtree(target)
+                    self._copy_path(target, shared_src)
+                self._remove_path(target)
             if not target.exists():
                 self._create_symlink(shared_src, target)
             if resource not in profile.shared_resources:
@@ -226,11 +240,28 @@ class ProfileManager:
                 link_target = target.resolve()
                 target.unlink()
                 if link_target.exists():
-                    shutil.copy2(str(link_target), str(target))
+                    self._copy_path(link_target, target)
             if resource in profile.shared_resources:
                 profile.shared_resources.remove(resource)
 
         profile.save()
+
+    @staticmethod
+    def _copy_path(src: Path, dst: Path) -> None:
+        """Copy a file or directory tree from *src* to *dst*."""
+        if src.is_dir():
+            shutil.copytree(str(src), str(dst))
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+
+    @staticmethod
+    def _remove_path(path: Path) -> None:
+        """Remove a file or directory tree."""
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
 
     def _create_symlink(self, src: Path, dst: Path) -> None:
         src.parent.mkdir(parents=True, exist_ok=True)

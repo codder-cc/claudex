@@ -13,34 +13,12 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib  # type: ignore[no-reuse-import]
 
-try:
-    import tomllib as _tomllib_write  # noqa: F401 — only for type check
-except ImportError:
-    pass
+import tomli_w
 
 
 def _write_toml(data: dict, path: Path) -> None:
-    """Simple TOML serialiser (no external write dependency needed for our schema)."""
-    lines = []
-    for key, value in data.items():
-        if isinstance(value, dict):
-            lines.append(f"\n[{key}]")
-            for k, v in value.items():
-                lines.append(f"{k} = {_toml_value(v)}")
-        else:
-            lines.append(f"{key} = {_toml_value(value)}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _toml_value(v: Any) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, list):
-        items = ", ".join(_toml_value(i) for i in v)
-        return f"[{items}]"
-    return str(v)
+    """Serialise config to TOML with correct escaping (via tomli_w)."""
+    path.write_text(tomli_w.dumps(data), encoding="utf-8")
 
 
 _DEFAULT_CONFIG: dict[str, Any] = {
@@ -61,8 +39,14 @@ class GlobalConfig:
 
     def load(self) -> "GlobalConfig":
         if self._path.exists():
-            with open(self._path, "rb") as f:
-                self._data = tomllib.load(f)
+            try:
+                with open(self._path, "rb") as f:
+                    loaded = tomllib.load(f)
+            except (tomllib.TOMLDecodeError, OSError):
+                loaded = {}
+            # Merge over defaults so newly-added keys are always present and a
+            # partial/older file doesn't get truncated when re-saved.
+            self._data = {**_DEFAULT_CONFIG, **loaded}
         else:
             self._data = dict(_DEFAULT_CONFIG)
         return self

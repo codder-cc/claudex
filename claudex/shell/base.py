@@ -31,7 +31,15 @@ class ShellIntegration(ABC):
         from claudex.constants import SHELL_MARKER_BEGIN, SHELL_MARKER_END
         if init_file is None:
             candidates = self.get_init_files()
-            init_file = candidates[0] if candidates else Path.home() / ".bashrc"
+            # Prefer a file that already has our block, then any existing file,
+            # then the first candidate — so we don't install into a file the
+            # shell never sources (e.g. .bashrc when only .bash_profile is read).
+            init_file = (
+                next((c for c in candidates if c.exists()
+                      and SHELL_MARKER_BEGIN in c.read_text(encoding="utf-8", errors="ignore")), None)
+                or next((c for c in candidates if c.exists()), None)
+                or (candidates[0] if candidates else Path.home() / ".bashrc")
+            )
 
         init_file.parent.mkdir(parents=True, exist_ok=True)
         existing = init_file.read_text(encoding="utf-8") if init_file.exists() else ""
@@ -44,12 +52,11 @@ class ShellIntegration(ABC):
 
     def is_installed(self, init_file: Path | None = None) -> bool:
         from claudex.constants import SHELL_MARKER_BEGIN
-        if init_file is None:
-            candidates = self.get_init_files()
-            init_file = candidates[0] if candidates else Path.home() / ".bashrc"
-        if not init_file.exists():
-            return False
-        return SHELL_MARKER_BEGIN in init_file.read_text(encoding="utf-8")
+        candidates = [init_file] if init_file is not None else self.get_init_files()
+        for f in candidates:
+            if f and f.exists() and SHELL_MARKER_BEGIN in f.read_text(encoding="utf-8", errors="ignore"):
+                return True
+        return False
 
 
 def _remove_block(text: str, begin: str, end: str) -> str:

@@ -8,6 +8,11 @@ from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDEX_HOME, CURRENT_ENV_P
 from claudex.shell.base import ShellIntegration
 
 
+def _ps_q(value: str) -> str:
+    """Single-quote *value* for PowerShell (no interpolation; doubles embedded quotes)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 class PowerShellIntegration(ShellIntegration):
     def get_init_files(self) -> list[Path]:
         """Return PowerShell profile path(s)."""
@@ -27,7 +32,7 @@ class PowerShellIntegration(ShellIntegration):
         return [home / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"]
 
     def generate_env_file(self, config_dir: Path) -> str:
-        return f'$env:{CLAUDE_CONFIG_DIR_ENV} = "{config_dir}"\n'
+        return f'$env:{CLAUDE_CONFIG_DIR_ENV} = {_ps_q(config_dir)}\n'
 
     def generate_switch_function(self) -> str:
         env_file = CURRENT_ENV_PWSH
@@ -50,7 +55,7 @@ Set-Alias claudex-switch Switch-ClaudeProfile"""
         fn_name = f"claude-{profile_name}"
         return f"""
 function {fn_name} {{
-    $env:{CLAUDE_CONFIG_DIR_ENV} = "{config_dir}"
+    $env:{CLAUDE_CONFIG_DIR_ENV} = {_ps_q(config_dir)}
     claude @args
 }}"""
 
@@ -80,7 +85,7 @@ _ClaudexDirHook  # run on profile load"""
     def generate_init_script(self, profiles: list) -> str:
         parts = [
             f'# claudex {len(profiles)} profile(s) — auto-generated',
-            f'$env:CLAUDEX_HOME = "{CLAUDEX_HOME}"',
+            f'$env:CLAUDEX_HOME = {_ps_q(CLAUDEX_HOME)}',
             '',
             self.generate_switch_function(),
             '',

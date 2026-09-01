@@ -3,8 +3,13 @@
 Share token format:
     "cx_" + base64url( uuid_bytes(16) + aes_key(32) )  = "cx_" + 64 chars
 
-The server receives only the uuid (token_id) and the ciphertext. The AES key
-is never sent to or stored on the server — it lives only in the share token.
+Security model (important):
+    The token embeds the AES key. ``claudex share push`` currently uploads the
+    full ``cx_`` token to the server so that ``share pull <label>`` can fetch the
+    key without the user copy-pasting it. This is a convenience trade-off, NOT a
+    zero-knowledge design: a server compromise can decrypt every bundle (which
+    includes credentials). If you need the server to never see the key, pull by
+    the ``cx_`` token instead of by label and do not upload the token.
 """
 
 from __future__ import annotations

@@ -21,9 +21,17 @@ Files excluded:
 from __future__ import annotations
 
 import io
+import os
 import tarfile
 from pathlib import Path
 from typing import Set
+
+# Hard cap on the decompressed size of an imported bundle (defends against
+# zip/tar bombs). Profile config is small; 200 MB is far above any real bundle.
+_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+
+# Files that must never be world/group-readable once extracted.
+_SECRET_NAMES: Set[str] = {".credentials.json", "credentials.json", ".claude.json"}
 
 # Top-level names to include (files) and directories to include recursively
 _INCLUDE_FILES: Set[str] = {
@@ -83,12 +91,45 @@ def import_bundle(bundle_bytes: bytes, target_config_dir: Path) -> None:
     target_config_dir.mkdir(parents=True, exist_ok=True)
     buf = io.BytesIO(bundle_bytes)
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-        for member in tar.getmembers():
-            # Safety: reject absolute paths and path traversal
-            member_path = Path(member.name)
-            if member_path.is_absolute() or ".." in member_path.parts:
-                continue
-            tar.extract(member, path=target_config_dir)
+        safe_extract(tar, target_config_dir)
+
+
+def safe_extract(tar: tarfile.TarFile, target_dir: Path) -> None:
+    """Extract *tar* into *target_dir*, rejecting anything unsafe.
+
+    Bundles are untrusted (they may be pulled from a sharing server), so this
+    guards against the CVE-2007-4559 tar path-traversal class:
+
+      * absolute paths and ``..`` components are skipped;
+      * symlinks, hardlinks, devices, FIFOs are skipped (only regular files and
+        directories are extracted) — a symlink member could otherwise redirect a
+        later member outside the target tree;
+      * the resolved destination is verified to stay within *target_dir*;
+      * the total decompressed size is capped to defuse decompression bombs;
+      * extracted credential files are locked down to mode 0600.
+    """
+    target_dir = target_dir.resolve()
+    total = 0
+    for member in tar.getmembers():
+        member_path = Path(member.name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            continue
+        # Only regular files and directories — never links/devices.
+        if not (member.isreg() or member.isdir()):
+            continue
+        dest = (target_dir / member.name).resolve()
+        if dest != target_dir and target_dir not in dest.parents:
+            continue
+        if member.isreg():
+            total += member.size
+            if total > _MAX_TOTAL_BYTES:
+                raise ValueError("Bundle exceeds maximum allowed size (possible tar bomb)")
+        tar.extract(member, path=target_dir)
+        if member.isreg() and Path(member.name).name in _SECRET_NAMES:
+            try:
+                os.chmod(dest, 0o600)
+            except OSError:
+                pass
 
 
 def _add_dir(tar: tarfile.TarFile, dir_path: Path, arcname: str) -> None:

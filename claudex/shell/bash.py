@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDEX_HOME, CURRENT_ENV_BASH
 from claudex.shell.base import ShellIntegration
+
+
+def _q(value: str) -> str:
+    """POSIX-shell-quote *value* so it is safe to interpolate into a sourced script."""
+    return shlex.quote(str(value))
 
 
 class BashIntegration(ShellIntegration):
@@ -13,15 +19,20 @@ class BashIntegration(ShellIntegration):
         self.shell = shell  # "bash", "zsh", or "fish"
 
     def get_init_files(self) -> list[Path]:
+        from claudex.constants import IS_MACOS
         home = Path.home()
         if self.shell == "zsh":
             return [home / ".zshrc"]
         if self.shell == "fish":
             return [home / ".config" / "fish" / "config.fish"]
+        # On macOS, Terminal/iTerm start *login* shells, which read .bash_profile
+        # (and not .bashrc unless it explicitly sources it), so prefer it there.
+        if IS_MACOS:
+            return [home / ".bash_profile", home / ".bashrc"]
         return [home / ".bashrc", home / ".bash_profile"]
 
     def generate_env_file(self, config_dir: Path) -> str:
-        return f'export {CLAUDE_CONFIG_DIR_ENV}="{config_dir}"\n'
+        return f'export {CLAUDE_CONFIG_DIR_ENV}={_q(config_dir)}\n'
 
     def generate_switch_function(self) -> str:
         env_file = CURRENT_ENV_BASH
@@ -46,9 +57,11 @@ claudex-switch() {{
 }}"""
 
     def generate_profile_alias(self, profile_name: str, config_dir: Path) -> str:
+        # profile_name is a validated slug (see validate_profile_name); the config
+        # dir is shell-quoted in case the user's home path contains spaces/quotes.
         return f"""
 claude-{profile_name}() {{
-    {CLAUDE_CONFIG_DIR_ENV}="{config_dir.as_posix()}" claude "$@"
+    {CLAUDE_CONFIG_DIR_ENV}={_q(config_dir.as_posix())} claude "$@"
 }}"""
 
     def generate_chpwd_hook(self) -> str:
@@ -90,7 +103,7 @@ _claudex_chpwd_hook  # run on shell startup"""
     def generate_init_script(self, profiles: list) -> str:
         parts = [
             f'# claudex {len(profiles)} profile(s) — auto-generated, edit with: claudex shell setup',
-            f'export CLAUDEX_HOME="{CLAUDEX_HOME}"',
+            f'export CLAUDEX_HOME={_q(CLAUDEX_HOME)}',
             '',
             self.generate_switch_function(),
             '',
