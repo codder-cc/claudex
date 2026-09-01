@@ -74,10 +74,18 @@ class HistoryWidget(Widget):
                 key=s.session_id,
             )
 
+    def _reload_current(self) -> None:
+        """Re-run the active search/filter (used after mutating actions)."""
+        search = self.query_one("#search-input", Input).value
+        selector = self.query_one("#profile-filter", Select)
+        pf = str(selector.value) if selector.value and selector.value is not Select.BLANK else ""
+        self._load_sessions(search, pf)
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
             selector = self.query_one("#profile-filter", Select)
-            self._load_sessions(event.value, str(selector.value) if selector.value else "")
+            pf = str(selector.value) if selector.value and selector.value is not Select.BLANK else ""
+            self._load_sessions(event.value, pf)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "profile-filter":
@@ -133,7 +141,7 @@ class HistoryWidget(Widget):
         try:
             profile = self._pm.get(to_profile_name)
             self._browser.migrate_session(session, to_profile_name, profile.config_dir)
-            self._load_sessions()
+            self._reload_current()
             self.notify(f"Session migrated to '{to_profile_name}'")
         except Exception as e:
             self.notify(str(e), severity="error")
@@ -153,7 +161,7 @@ class HistoryWidget(Widget):
             self._browser.delete_session(session)
         if session in self._sessions:
             self._sessions.remove(session)
-        self._load_sessions()
+        self._reload_current()
         self.notify("Session deleted.")
 
     def action_focus_search(self) -> None:

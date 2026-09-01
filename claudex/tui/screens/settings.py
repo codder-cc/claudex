@@ -109,17 +109,31 @@ class SettingsWidget(Widget):
         except Exception as e:
             self.notify(str(e), severity="error")
 
+    @staticmethod
+    def _sel_value(select: "Select", fallback: str) -> str:
+        """Read a Select's value, mapping the BLANK sentinel to a real string.
+
+        Without this, an unmatched value serialises as the literal "Select.BLANK"
+        and corrupts config.toml.
+        """
+        value = select.value
+        if value is Select.BLANK or value is None:
+            return fallback
+        return str(value)
+
     def action_save_settings(self) -> None:
         try:
-            default = self.query_one("#sel-default", Select).value
-            shell = self.query_one("#sel-shell", Select).value
-            theme = self.query_one("#sel-theme", Select).value
-            resume = self.query_one("#sel-resume", Select).value
+            # Reload so we don't overwrite keys changed elsewhere since mount.
+            self._cfg = load_config()
+            default = self._sel_value(self.query_one("#sel-default", Select), "")
+            shell = self._sel_value(self.query_one("#sel-shell", Select), "auto")
+            theme = self._sel_value(self.query_one("#sel-theme", Select), "dark")
+            resume = self._sel_value(self.query_one("#sel-resume", Select), "env")
             auto_switch = self.query_one("#chk-autoswitch", Checkbox).value
-            self._cfg.set("default_profile", str(default) if default else "")
-            self._cfg.set("shell", str(shell))
-            self._cfg.set("theme", str(theme))
-            self._cfg.set("resume_strategy", str(resume))
+            self._cfg.set("default_profile", default)
+            self._cfg.set("shell", shell)
+            self._cfg.set("theme", theme)
+            self._cfg.set("resume_strategy", resume)
             self._cfg.set("auto_switch", auto_switch)
             self._cfg.save()
             self.notify("Settings saved.")

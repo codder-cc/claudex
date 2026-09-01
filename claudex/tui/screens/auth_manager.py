@@ -55,6 +55,8 @@ class AuthManagerWidget(Widget):
 
     def _load_profiles(self) -> None:
         self._profiles = self._pm.list()
+        # Rebuild from scratch so deleted/renamed profiles don't leave stale status.
+        self._statuses = {}
         lv = self.query_one("#auth-list", ListView)
         lv.clear()
         for profile in self._profiles:
@@ -128,10 +130,14 @@ class AuthManagerWidget(Widget):
         profile = self._selected
         default_claude = Path.home() / ".claude"
         candidates = [
-            Path(os.environ.get("CLAUDE_CONFIG_DIR", "")) / ".credentials.json",
             default_claude / ".credentials.json",
             Path.home() / ".claude.json",
         ]
+        # Only consider CLAUDE_CONFIG_DIR if it's actually set — Path("")/"x" would
+        # resolve relative to the CWD and import the wrong file.
+        existing_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        if existing_dir:
+            candidates.insert(0, Path(existing_dir) / ".credentials.json")
         import json as _json
         import shutil
         for cred_file in candidates:

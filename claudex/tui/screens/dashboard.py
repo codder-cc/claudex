@@ -77,6 +77,8 @@ class DashboardWidget(Widget):
         table = self.query_one("#profile-table", DataTable)
         table.clear()
         self._profiles = self._pm.list()
+        # Rebuild from scratch so deleted/renamed profiles don't leave stale status.
+        self._statuses = {}
         active = self._pm.get_active()
 
         for profile in self._profiles:
@@ -86,7 +88,7 @@ class DashboardWidget(Widget):
             except Exception:
                 status = None
 
-            is_active = active == profile.name or str(profile.config_dir) in active
+            is_active = active == profile.name or active == str(profile.config_dir)
             marker = "▶" if is_active else " "
             auth_icon, _ = AUTH_ICONS.get(getattr(status, "auth_type", "none"), AUTH_ICONS["none"])
 

@@ -23,7 +23,11 @@ class ClaudexApp(App):
     SUB_TITLE = "Claude Code profile manager"
 
     BINDINGS = [
-        Binding("q", "quit", "Quit", priority=True),
+        # Not priority: a priority binding would swallow "q"/"1".."4" typed into
+        # Input fields (profile name, email, API key, search). ctrl+q always quits
+        # regardless of focus for when an Input has the keyboard.
+        Binding("q", "quit", "Quit"),
+        Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
         Binding("1", "show_tab('profiles')", "Profiles"),
         Binding("2", "show_tab('history')", "History"),
         Binding("3", "show_tab('auth')", "Auth"),
