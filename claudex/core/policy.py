@@ -39,6 +39,27 @@ from claudex.constants import CLAUDEX_HOME
 
 POLICY_DIR = CLAUDEX_HOME / "policy"          # per-profile state files
 SHIM_DIR = CLAUDEX_HOME / "shim"              # the Node preload shim lives here
+TEMPLATES_DIR = POLICY_DIR / "templates"      # user-defined policy templates (*.json)
+
+#: Built-in policy templates — ready-made managed-settings payloads you can drop
+#: in with `claudex policy default` / `--template` instead of hand-writing JSON.
+#:
+#: They must be NON-EMPTY: Claude Code treats an empty managed-settings object as
+#: "no managed settings" (it clears the cache), so an empty template would behave
+#: like `reject` rather than assert a policy layer. The `default` baseline imposes
+#: no permission restrictions and turns telemetry off via the managed `env` block
+#: (applied to process.env with top priority), so it cleanly supersedes a
+#: restrictive/ telemetry-heavy remote policy with a permissive local one.
+BUILTIN_TEMPLATES: dict[str, dict] = {
+    "default": {
+        "env": {"DISABLE_TELEMETRY": "1"},
+    },
+    "private": {
+        # Harder privacy stance: also suppress all nonessential network traffic
+        # (auto-update, release notes, model-capabilities probes, …).
+        "env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+    },
+}
 
 #: Bump when the shim source below changes so ``ensure_shim`` rewrites it.
 SHIM_VERSION = 1
@@ -61,17 +82,22 @@ def _state_path(profile: str, policy_dir: Path = POLICY_DIR) -> Path:
 
 
 def get_policy(profile: str, policy_dir: Path = POLICY_DIR) -> dict:
-    """Return the stored policy for *profile* as ``{"mode", "settings"}``.
+    """Return the stored policy for *profile* as ``{"mode", "settings", "label"}``.
 
-    Missing or unreadable state is reported as ``{"mode": "off", "settings": None}``.
+    Missing or unreadable state is reported as mode ``off``. ``label`` is an
+    optional human tag (e.g. a template name) or ``None``.
     """
     try:
         data = json.loads(_state_path(profile, policy_dir).read_text(encoding="utf-8"))
         if isinstance(data, dict) and data.get("mode") in VALID_MODES:
-            return {"mode": data["mode"], "settings": data.get("settings")}
+            return {
+                "mode": data["mode"],
+                "settings": data.get("settings"),
+                "label": data.get("label"),
+            }
     except (OSError, ValueError, json.JSONDecodeError):
         pass
-    return {"mode": "off", "settings": None}
+    return {"mode": "off", "settings": None, "label": None}
 
 
 def set_policy(
@@ -79,17 +105,19 @@ def set_policy(
     mode: str,
     settings: Optional[dict] = None,
     policy_dir: Path = POLICY_DIR,
+    label: Optional[str] = None,
 ) -> dict:
     """Persist the policy for *profile*. ``off`` clears the state file.
 
     For ``set``, *settings* must be a JSON object (the managed-settings payload
-    Claude Code will apply). Returns the resulting policy dict.
+    Claude Code will apply). *label* is an optional tag shown by ``show`` (e.g.
+    the template name). Returns the resulting policy dict.
     """
     if mode not in VALID_MODES:
         raise ValueError(f"unknown policy mode {mode!r}; expected one of {VALID_MODES}")
     if mode == "off":
         clear_policy(profile, policy_dir)
-        return {"mode": "off", "settings": None}
+        return {"mode": "off", "settings": None, "label": None}
     if mode == "set":
         if not isinstance(settings, dict):
             raise ValueError("mode 'set' requires a settings object (dict)")
@@ -97,14 +125,59 @@ def set_policy(
         settings = None
 
     policy_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 1, "mode": mode, "settings": settings}
+    payload = {"version": 1, "mode": mode, "settings": settings, "label": label}
     path = _state_path(profile, policy_dir)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     try:
         path.chmod(0o600)
     except OSError:
         pass
-    return {"mode": mode, "settings": settings}
+    return {"mode": mode, "settings": settings, "label": label}
+
+
+# ---------------------------------------------------------------------------
+# Templates — ready-made managed-settings payloads
+# ---------------------------------------------------------------------------
+
+def list_templates(templates_dir: Path = TEMPLATES_DIR) -> dict[str, str]:
+    """Return available template names → source ('built-in' or a file path)."""
+    out: dict[str, str] = {name: "built-in" for name in BUILTIN_TEMPLATES}
+    try:
+        for f in sorted(templates_dir.glob("*.json")):
+            out[f.stem] = str(f)  # a file shadows a built-in of the same name
+    except OSError:
+        pass
+    return out
+
+
+def load_template(name: str, templates_dir: Path = TEMPLATES_DIR) -> dict:
+    """Load a template's settings object by name.
+
+    A ``<name>.json`` file in *templates_dir* takes precedence over a built-in,
+    letting you override or extend the baseline. Raises ``KeyError``/``ValueError``
+    if the name is unknown or the file is not a JSON object.
+    """
+    f = templates_dir / f"{name}.json"
+    if f.exists():
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"template file {f} must contain a JSON object")
+        return data
+    if name in BUILTIN_TEMPLATES:
+        # Return a copy so callers can't mutate the module-level dict.
+        return json.loads(json.dumps(BUILTIN_TEMPLATES[name]))
+    raise KeyError(name)
+
+
+def apply_template(
+    profile: str,
+    name: str,
+    policy_dir: Path = POLICY_DIR,
+    templates_dir: Path = TEMPLATES_DIR,
+) -> dict:
+    """Activate template *name* for *profile* (as a ``set`` policy, labelled)."""
+    settings = load_template(name, templates_dir)
+    return set_policy(profile, "set", settings, policy_dir, label=f"template:{name}")
 
 
 def clear_policy(profile: str, policy_dir: Path = POLICY_DIR) -> None:

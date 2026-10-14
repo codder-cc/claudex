@@ -18,7 +18,8 @@ from claudex.core import policy
 # ---------------------------------------------------------------------------
 
 def test_default_policy_is_off(tmp_path):
-    assert policy.get_policy("work", policy_dir=tmp_path) == {"mode": "off", "settings": None}
+    assert policy.get_policy("work", policy_dir=tmp_path) == {
+        "mode": "off", "settings": None, "label": None}
 
 
 def test_set_reject_and_read_back(tmp_path):
@@ -61,6 +62,48 @@ def test_unknown_mode_rejected(tmp_path):
 def test_corrupt_state_reads_as_off(tmp_path):
     (tmp_path / "work.json").write_text("{not json", encoding="utf-8")
     assert policy.get_policy("work", policy_dir=tmp_path)["mode"] == "off"
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+def test_builtin_default_template_is_nonempty(tmp_path):
+    t = policy.load_template("default", templates_dir=tmp_path)
+    assert t  # non-empty, else it would collapse to "no managed settings"
+    assert t["env"]["DISABLE_TELEMETRY"] == "1"
+
+
+def test_list_templates_includes_builtins(tmp_path):
+    names = policy.list_templates(templates_dir=tmp_path)
+    assert "default" in names and names["default"] == "built-in"
+    assert "private" in names
+
+
+def test_custom_template_file_shadows_builtin(tmp_path):
+    (tmp_path / "default.json").write_text('{"env": {"FOO": "bar"}}', encoding="utf-8")
+    t = policy.load_template("default", templates_dir=tmp_path)
+    assert t == {"env": {"FOO": "bar"}}
+    assert policy.list_templates(templates_dir=tmp_path)["default"] != "built-in"
+
+
+def test_unknown_template_raises(tmp_path):
+    with pytest.raises(KeyError):
+        policy.load_template("nope", templates_dir=tmp_path)
+
+
+def test_apply_template_sets_labelled_policy(tmp_path):
+    policy.apply_template("work", "default", policy_dir=tmp_path, templates_dir=tmp_path)
+    pol = policy.get_policy("work", policy_dir=tmp_path)
+    assert pol["mode"] == "set"
+    assert pol["label"] == "template:default"
+    assert pol["settings"]["env"]["DISABLE_TELEMETRY"] == "1"
+
+
+def test_template_file_must_be_object(tmp_path):
+    (tmp_path / "bad.json").write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(ValueError):
+        policy.load_template("bad", templates_dir=tmp_path)
 
 
 # ---------------------------------------------------------------------------

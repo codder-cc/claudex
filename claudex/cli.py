@@ -994,10 +994,47 @@ def policy_show(name: Optional[str]) -> None:
         "freeze": "freeze — endpoint answers 304, keeps the cached file as-is",
         "set": "set — serving your own managed settings",
     }[mode]
-    console.print(f"Profile [bold]{name}[/bold]: [cyan]{desc}[/cyan]")
+    label = pol.get("label")
+    suffix = f" [{label}]" if label else ""
+    console.print(f"Profile [bold]{name}[/bold]: [cyan]{desc}[/cyan]{suffix}")
     if mode == "set":
         keys = sorted((pol.get("settings") or {}).keys())
         console.print(f"  settings keys: {', '.join(keys) if keys else '(empty object)'}")
+
+
+@policy_group.command("templates")
+def policy_templates() -> None:
+    """List available policy templates (built-in + your own)."""
+    from claudex.core.policy import list_templates
+    templates = list_templates()
+    if not templates:
+        console.print("No templates available.")
+        return
+    console.print("[bold]Policy templates:[/bold]")
+    for tname, src in templates.items():
+        tag = "built-in" if src == "built-in" else "custom"
+        console.print(f"  [cyan]{tname}[/cyan] ([dim]{tag}[/dim])")
+    console.print("\nApply with [cyan]claudex policy default[/cyan] or "
+                  "[cyan]claudex policy set <profile> -t <name>[/cyan].")
+    console.print(f"Add your own: drop [cyan]<name>.json[/cyan] into "
+                  f"[dim]{CLAUDEX_HOME / 'policy' / 'templates'}[/dim].")
+
+
+@policy_group.command("default")
+@click.argument("name", required=False, default=None)
+@click.option("--template", "-t", "template_name", default="default", show_default=True,
+              help="Which template to apply (see `claudex policy templates`).")
+def policy_default(name: Optional[str], template_name: str) -> None:
+    """Replace remote with a ready-made template (default: permissive, no telemetry)."""
+    from claudex.core.policy import apply_template
+    name = _resolve_policy_profile(name)
+    try:
+        apply_template(name, template_name)
+    except (KeyError, ValueError, OSError) as e:
+        console.print(f"[red]Error:[/red] template '{template_name}' not usable: {e}")
+        sys.exit(1)
+    console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will apply the "
+                  f"[cyan]{template_name}[/cyan] template instead of the remote policy.")
 
 
 @policy_group.command("reject")
@@ -1024,13 +1061,32 @@ def policy_freeze(name: Optional[str]) -> None:
 
 @policy_group.command("set")
 @click.argument("name", required=False, default=None)
-@click.option("--file", "-f", "settings_file", required=True,
+@click.option("--file", "-f", "settings_file", default=None,
               type=click.Path(exists=True, dir_okay=False),
               help="JSON file with the managed settings object to serve.")
-def policy_set(name: Optional[str], settings_file: str) -> None:
+@click.option("--template", "-t", "template_name", default=None,
+              help="Use a named template instead of a file "
+                   "(see `claudex policy templates`).")
+def policy_set(name: Optional[str], settings_file: Optional[str],
+               template_name: Optional[str]) -> None:
     """Serve your own managed settings for a profile (serve 200)."""
-    from claudex.core.policy import set_policy
+    from claudex.core.policy import set_policy, apply_template
     name = _resolve_policy_profile(name)
+    if bool(settings_file) == bool(template_name):
+        console.print("[red]Error:[/red] pass exactly one of --file or --template.")
+        sys.exit(1)
+
+    if template_name:
+        try:
+            pol = apply_template(name, template_name)
+        except (KeyError, ValueError, OSError) as e:
+            console.print(f"[red]Error:[/red] template '{template_name}' not usable: {e}")
+            sys.exit(1)
+        keys = sorted((pol.get("settings") or {}).keys())
+        console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will apply template "
+                      f"[cyan]{template_name}[/cyan] ({', '.join(keys) or '∅'}).")
+        return
+
     try:
         settings = json.loads(Path(settings_file).read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as e:
