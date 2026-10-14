@@ -1190,6 +1190,38 @@ def policy_off(name: Optional[str]) -> None:
                   f"backend for managed settings.{note}")
 
 
+@cli.command("proxy")
+@click.option("--port", "-p", default=8787, show_default=True, help="Local port to listen on.")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Local bind address.")
+def proxy_cmd(port: int, host: str) -> None:
+    """Run a local reverse proxy to api.anthropic.com.
+
+    Point a profile at it so Claude Code sees a non-Anthropic base URL and skips
+    the org managed-settings pull, while inference still reaches the real API:
+
+    \b
+      # terminal 1
+      claudex proxy
+      # terminal 2
+      CLAUDE_CONFIG_DIR=~/.claudex/profiles/<name> \\
+        ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+
+    Only works where the org policy is fail-open (an org that *requires* managed
+    settings blocks startup when the gateway is unreachable — not overridable
+    locally by design).
+    """
+    from claudex.core.proxy import serve_forever
+    console.print(f"[cyan]claudex proxy[/cyan] → forwarding "
+                  f"[bold]http://{host}:{port}[/bold] to [bold]api.anthropic.com[/bold]")
+    console.print(f"  Set [cyan]ANTHROPIC_BASE_URL=http://{host}:{port}[/cyan] for the profile.")
+    console.print("  [dim]Ctrl+C to stop.[/dim]")
+    try:
+        serve_forever(host, port)
+    except OSError as e:
+        console.print(f"[red]Error:[/red] could not bind {host}:{port}: {e}")
+        sys.exit(1)
+
+
 # ─── Config commands ──────────────────────────────────────────────────────────
 
 @cli.group("config")
