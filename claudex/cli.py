@@ -289,9 +289,25 @@ def use_profile(name: str, claude_args: tuple) -> None:
         am = _auth()
         profile = pm.get(name)
         env = {**os.environ, **am.get_env_for_profile(name, profile.config_dir)}
-        from claudex.core.policy import augment_env
+        from claudex.core.policy import augment_env, proxy_enabled
         augment_env(env, name, config_dir=profile.config_dir)
         cmd = [CLAUDE_BIN] + list(claude_args)
+
+        if proxy_enabled(name):
+            # Host the local api.anthropic.com proxy for this session so Claude
+            # Code sees a non-Anthropic base URL and skips the org policy. Run
+            # claude as a child (not exec) so we can stop the proxy afterwards.
+            from claudex.core.proxy import start_background
+            server, _thread, base = start_background()
+            env["ANTHROPIC_BASE_URL"] = base
+            console.print(f"[dim]proxy on → ANTHROPIC_BASE_URL={base} "
+                          f"(org managed policy skipped)[/dim]")
+            try:
+                result = subprocess.run(cmd, env=env)
+            finally:
+                server.shutdown()
+            sys.exit(result.returncode)
+
         if sys.platform != "win32":
             os.execvpe(cmd[0], cmd, env)  # replace this process (Unix)
         else:
@@ -1015,6 +1031,9 @@ def policy_show(name: Optional[str]) -> None:
         deny_s = (f"[red]{dc} deny rule(s)[/red]" if dc else "[green]no deny rules[/green]")
         locked = " [yellow]🔒 immutable[/yellow]" if is_immutable(remote_settings_path(cfg)) else ""
         console.print(f"  on-disk remote-settings.json: keys={sorted(live.keys()) or '∅'}, {deny_s}{locked}")
+    if pol.get("proxy"):
+        console.print("  [green]proxy mode ON[/green] — launches route through a local "
+                      "api.anthropic.com proxy (org policy skipped, fail-open orgs)")
     if pol.get("lock"):
         console.print("  [dim]lock requested — file made immutable at each launch[/dim]")
     if (cfg / REMOTE_SETTINGS_BACKUP).exists():
@@ -1175,6 +1194,27 @@ def policy_set(name: Optional[str], settings_file: Optional[str],
     keys = sorted(settings.keys())
     console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will apply your managed "
                   f"settings ({len(keys)} key(s): {', '.join(keys) or '∅'}).")
+
+
+@policy_group.command("proxy")
+@click.argument("name", required=False, default=None)
+@click.option("--off", is_flag=True, help="Disable proxy mode for the profile.")
+def policy_proxy(name: Optional[str], off: bool) -> None:
+    """Route a profile through the local api.anthropic.com proxy.
+
+    Claude Code then sees a non-Anthropic base URL and skips the org managed
+    policy (works only for fail-open orgs), while inference still reaches the
+    real API. `run`/`use` start and stop the proxy automatically.
+    """
+    from claudex.core.policy import set_proxy
+    name = _resolve_policy_profile(name)
+    set_proxy(name, not off)
+    if off:
+        console.print(f"[green]✓[/green] Proxy mode OFF for [bold]{name}[/bold].")
+    else:
+        console.print(f"[green]✓[/green] Proxy mode ON for [bold]{name}[/bold] — "
+                      f"[cyan]claudex run {name}[/cyan] (or [cyan]use[/cyan]) will skip the "
+                      f"org managed policy via a local proxy.")
 
 
 @policy_group.command("off")

@@ -111,10 +111,11 @@ def get_policy(profile: str, policy_dir: Path = POLICY_DIR) -> dict:
                 "settings": data.get("settings"),
                 "label": data.get("label"),
                 "lock": bool(data.get("lock", False)),
+                "proxy": bool(data.get("proxy", False)),
             }
     except (OSError, ValueError, json.JSONDecodeError):
         pass
-    return {"mode": "off", "settings": None, "label": None, "lock": False}
+    return {"mode": "off", "settings": None, "label": None, "lock": False, "proxy": False}
 
 
 def set_policy(
@@ -134,9 +135,24 @@ def set_policy(
     """
     if mode not in VALID_MODES:
         raise ValueError(f"unknown policy mode {mode!r}; expected one of {VALID_MODES}")
+    # Preserve an existing proxy flag across policy-mode changes.
+    prev_proxy = bool(get_policy(profile, policy_dir).get("proxy", False))
     if mode == "off":
+        if prev_proxy:
+            # Keep a minimal state file alive just for the proxy flag.
+            policy_dir.mkdir(parents=True, exist_ok=True)
+            off_payload = {"version": 1, "mode": "off", "settings": None,
+                           "label": None, "lock": False, "proxy": True}
+            path = _state_path(profile, policy_dir)
+            path.write_text(json.dumps(off_payload, indent=2) + "\n", encoding="utf-8")
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return {"mode": "off", "settings": None, "label": None,
+                    "lock": False, "proxy": True}
         clear_policy(profile, policy_dir)
-        return {"mode": "off", "settings": None, "label": None, "lock": False}
+        return {"mode": "off", "settings": None, "label": None, "lock": False, "proxy": False}
     if mode == "set":
         if not isinstance(settings, dict):
             raise ValueError("mode 'set' requires a settings object (dict)")
@@ -145,14 +161,15 @@ def set_policy(
 
     policy_dir.mkdir(parents=True, exist_ok=True)
     payload = {"version": 1, "mode": mode, "settings": settings,
-               "label": label, "lock": bool(lock)}
+               "label": label, "lock": bool(lock), "proxy": prev_proxy}
     path = _state_path(profile, policy_dir)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     try:
         path.chmod(0o600)
     except OSError:
         pass
-    return {"mode": mode, "settings": settings, "label": label, "lock": bool(lock)}
+    return {"mode": mode, "settings": settings, "label": label,
+            "lock": bool(lock), "proxy": prev_proxy}
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +227,36 @@ def clear_policy(profile: str, policy_dir: Path = POLICY_DIR) -> None:
         pass
     except OSError:
         pass
+
+
+def proxy_enabled(profile: str, policy_dir: Path = POLICY_DIR) -> bool:
+    """True if this profile should launch behind the local api.anthropic.com proxy.
+
+    Proxy mode points ANTHROPIC_BASE_URL at a local forwarder so Claude Code sees
+    a non-Anthropic host and skips the org managed-settings pull (fail-open orgs
+    only), while inference still reaches the real API.
+    """
+    return bool(get_policy(profile, policy_dir).get("proxy", False))
+
+
+def set_proxy(profile: str, on: bool, policy_dir: Path = POLICY_DIR) -> dict:
+    """Toggle proxy mode for *profile*, preserving any policy override fields."""
+    pol = get_policy(profile, policy_dir)
+    # If nothing else is set and proxy is being turned off, drop the state file.
+    if pol["mode"] == "off" and not pol.get("lock") and not on:
+        clear_policy(profile, policy_dir)
+        return {**pol, "proxy": False}
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "mode": pol["mode"], "settings": pol.get("settings"),
+               "label": pol.get("label"), "lock": pol.get("lock", False),
+               "proxy": bool(on)}
+    path = _state_path(profile, policy_dir)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return {**pol, "proxy": bool(on)}
 
 
 # ---------------------------------------------------------------------------

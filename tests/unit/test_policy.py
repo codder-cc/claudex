@@ -21,7 +21,22 @@ from claudex.core import policy
 
 def test_default_policy_is_off(tmp_path):
     assert policy.get_policy("work", policy_dir=tmp_path) == {
-        "mode": "off", "settings": None, "label": None, "lock": False}
+        "mode": "off", "settings": None, "label": None, "lock": False, "proxy": False}
+
+
+def test_proxy_toggle_persists_and_survives_policy_changes(tmp_path):
+    assert policy.proxy_enabled("work", policy_dir=tmp_path) is False
+    policy.set_proxy("work", True, policy_dir=tmp_path)
+    assert policy.proxy_enabled("work", policy_dir=tmp_path) is True
+    # Setting a policy mode must not wipe the proxy flag.
+    policy.set_policy("work", "reject", policy_dir=tmp_path)
+    assert policy.proxy_enabled("work", policy_dir=tmp_path) is True
+    # policy off keeps proxy on (orthogonal); proxy --off clears it.
+    policy.set_policy("work", "off", policy_dir=tmp_path)
+    assert policy.proxy_enabled("work", policy_dir=tmp_path) is True
+    policy.set_proxy("work", False, policy_dir=tmp_path)
+    assert policy.proxy_enabled("work", policy_dir=tmp_path) is False
+    assert not (tmp_path / "work.json").exists()   # fully reset → state file gone
 
 
 def test_set_reject_and_read_back(tmp_path):

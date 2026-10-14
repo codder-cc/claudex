@@ -325,6 +325,8 @@ class Supervisor:
         self._hooked_dirs: set[Path] = set()
         self._child: Optional[subprocess.Popen] = None
         self._shutdown = False
+        self._proxy_server = None          # local api.anthropic.com proxy (lazy)
+        self._proxy_base: Optional[str] = None
 
     # -- liveness --------------------------------------------------------
     def _write_liveness(self) -> None:
@@ -426,6 +428,25 @@ class Supervisor:
         self._hooked_dirs.clear()
 
     # -- process control -------------------------------------------------
+    def _proxy_base_for(self, profile: str) -> Optional[str]:
+        """Return the local-proxy base URL for *profile*, starting the proxy once
+        (shared across relaunches/switches) if proxy mode is enabled."""
+        from claudex.core.policy import proxy_enabled
+        if not proxy_enabled(profile):
+            return None
+        if self._proxy_server is None:
+            from claudex.core.proxy import start_background
+            self._proxy_server, _thread, self._proxy_base = start_background()
+        return self._proxy_base
+
+    def _stop_proxy(self) -> None:
+        if self._proxy_server is not None:
+            try:
+                self._proxy_server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            self._proxy_server = None
+
     def _env_for(self, config_dir: str, profile: str) -> dict:
         env = {**os.environ,
                CLAUDE_CONFIG_DIR_ENV: config_dir,
@@ -436,6 +457,12 @@ class Supervisor:
         # remote-settings.json cache.
         from claudex.core.policy import augment_env
         augment_env(env, profile, config_dir=Path(config_dir))
+        # Proxy mode: point ANTHROPIC_BASE_URL at the local forwarder so the org
+        # managed policy is skipped (fail-open orgs); inference still reaches the
+        # real API through the proxy.
+        base = self._proxy_base_for(profile)
+        if base:
+            env["ANTHROPIC_BASE_URL"] = base
         return env
 
     def _run_child_until_switch_or_exit(
@@ -539,6 +566,7 @@ class Supervisor:
         finally:
             self._clear_liveness()
             self._restore_hooks()
+            self._stop_proxy()
 
     def run_dry(self, timeout: Optional[float] = None) -> Optional[PlannedLaunch]:
         """Dry-run: register liveness, wait for one switch request, print the
