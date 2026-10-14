@@ -74,6 +74,7 @@ Usage:
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -288,6 +289,8 @@ def use_profile(name: str, claude_args: tuple) -> None:
         am = _auth()
         profile = pm.get(name)
         env = {**os.environ, **am.get_env_for_profile(name, profile.config_dir)}
+        from claudex.core.policy import augment_env
+        augment_env(env, name)
         cmd = [CLAUDE_BIN] + list(claude_args)
         if sys.platform != "win32":
             os.execvpe(cmd[0], cmd, env)  # replace this process (Unix)
@@ -848,6 +851,209 @@ def internal_write_env(profile_name: str) -> None:
         sys.exit(0)
     except ClaudexError:
         sys.exit(1)
+
+
+@internal_group.command("switch-request")
+def internal_switch_request() -> None:
+    """UserPromptSubmit hook: turn a `/switch <target>` prompt into a switch
+    request the supervisor applies. Reads the hook JSON on stdin.
+
+    Never touches credentials. Writes only ~/.claudex/.switch_request, and only
+    for a valid `/switch`. Any other prompt passes straight through (exit 0, no
+    output), so the hook is invisible during normal use.
+    """
+    from claudex.core.supervisor import handle_switch_hook
+    stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    out, code = handle_switch_hook(stdin_text)
+    if out:
+        sys.stdout.write(out)
+    sys.exit(code)
+
+
+@internal_group.command("hook-config")
+def internal_hook_config() -> None:
+    """Print the settings.json snippet that registers the /switch hook."""
+    import json as _json
+    snippet = {
+        "hooks": {
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command",
+                            "command": "claudex _internal switch-request"}]}
+            ]
+        }
+    }
+    print(_json.dumps(snippet, indent=2))
+
+
+@internal_group.command("restore-hook")
+@click.argument("name")
+def internal_restore_hook(name: str) -> None:
+    """Remove the /switch hook from a profile's settings.json (manual cleanup
+    if a supervisor exited without restoring it)."""
+    from claudex.core.supervisor import restore_hook
+    try:
+        pm = _pm()
+        restore_hook(pm.get(name).config_dir)
+        console.print(f"[green]✓[/green] Hook restored/removed for '{name}'.")
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+# ─── Supervisor (in-session switch) ───────────────────────────────────────────
+
+@cli.command("run", context_settings={"ignore_unknown_options": True})
+@click.argument("name")
+@click.option("--dry-run", is_flag=True,
+              help="Wait for one /switch, print the launch plan, do NOT spawn/kill claude.")
+@click.option("--timeout", type=float, default=None,
+              help="Dry-run only: seconds to wait for a /switch before giving up.")
+@click.option("--install-hook/--no-install-hook", default=True,
+              help="Install the /switch hook into each profile's settings.json "
+                   "(restored on exit). On by default.")
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def run_supervisor(name: str, dry_run: bool, timeout: Optional[float],
+                   install_hook: bool, claude_args: tuple) -> None:
+    """Run claude under a supervisor that applies in-session profile switches.
+
+    Live mode (default): hosts claude under NAME; when you type
+    `switch <profile>` (a plain message, no slash) in the session, the
+    supervisor carries the conversation into that profile and relaunches
+    `claude --resume` there. Switching never touches credentials (Model 1:
+    transcript carry only).
+
+    `--dry-run` waits for a single switch, prints the relaunch plan, and exits
+    without spawning or killing claude.
+    """
+    from claudex.core.supervisor import Supervisor
+    try:
+        if dry_run:
+            sup = Supervisor(name, dry_run=True, extra_args=list(claude_args),
+                             install_hook=False)
+            console.print(f"[cyan]Supervisor (dry-run) active for [bold]{name}[/bold]. "
+                          f"Waiting for a /switch request…[/cyan]")
+            plan = sup.run_dry(timeout=timeout)
+            if plan is None:
+                console.print("[yellow]No /switch request received within the timeout.[/yellow]")
+                sys.exit(1)
+            console.print(f"[green]✓[/green] Switch request → [bold]{plan.target}[/bold]")
+            console.print(f"  Plan: {plan.describe()}")
+            console.print(f"  Command: [cyan]{' '.join(plan.cmd)}[/cyan]")
+            return
+        sup = Supervisor(name, extra_args=list(claude_args), install_hook=install_hook)
+        console.print(f"[cyan]Launching claude under profile [bold]{name}[/bold] "
+                      f"(supervisor). Type [bold]switch <profile>[/bold] "
+                      f"(a plain message, no slash) to switch.[/cyan]")
+        rc = sup.run()
+        sys.exit(rc)
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    except FileNotFoundError:
+        console.print("[red]Error:[/red] Claude CLI not found. Install from https://claude.ai/code")
+        sys.exit(1)
+
+
+# ─── Policy commands (local remote-settings override) ─────────────────────────
+
+def _resolve_policy_profile(name: Optional[str]) -> str:
+    """Resolve an optional profile arg to a concrete, existing profile name,
+    defaulting to the active profile. Exits with a helpful error otherwise."""
+    pm = _pm()
+    if not name:
+        name = pm.get_active()
+    if not name or not pm.exists(name):
+        console.print("[red]Error:[/red] no such profile. Pass a profile name "
+                      "explicitly (see [cyan]claudex list[/cyan]).")
+        sys.exit(1)
+    return name
+
+
+@cli.group("policy")
+def policy_group() -> None:
+    """Locally control Claude Code's remote managed settings, per profile.
+
+    Claude Code pulls enterprise "managed settings" from the backend and applies
+    them as a read-only, top-priority layer you can't soften locally. These
+    commands intercept that one endpoint for a profile so you decide what it
+    sees: reject it, freeze the current cache, or serve your own settings.
+    """
+
+
+@policy_group.command("show")
+@click.argument("name", required=False, default=None)
+def policy_show(name: Optional[str]) -> None:
+    """Show the active policy for a profile (default: active profile)."""
+    from claudex.core.policy import get_policy
+    name = _resolve_policy_profile(name)
+    pol = get_policy(name)
+    mode = pol["mode"]
+    desc = {
+        "off": "off — Claude Code uses the real backend",
+        "reject": "reject — endpoint answers 204, no managed settings applied",
+        "freeze": "freeze — endpoint answers 304, keeps the cached file as-is",
+        "set": "set — serving your own managed settings",
+    }[mode]
+    console.print(f"Profile [bold]{name}[/bold]: [cyan]{desc}[/cyan]")
+    if mode == "set":
+        keys = sorted((pol.get("settings") or {}).keys())
+        console.print(f"  settings keys: {', '.join(keys) if keys else '(empty object)'}")
+
+
+@policy_group.command("reject")
+@click.argument("name", required=False, default=None)
+def policy_reject(name: Optional[str]) -> None:
+    """Reject remote managed settings for a profile (serve 204)."""
+    from claudex.core.policy import set_policy
+    name = _resolve_policy_profile(name)
+    set_policy(name, "reject")
+    console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will reject remote "
+                  f"managed settings (next launch / within the hour).")
+
+
+@policy_group.command("freeze")
+@click.argument("name", required=False, default=None)
+def policy_freeze(name: Optional[str]) -> None:
+    """Freeze the current cached remote settings for a profile (serve 304)."""
+    from claudex.core.policy import set_policy
+    name = _resolve_policy_profile(name)
+    set_policy(name, "freeze")
+    console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will keep its cached "
+                  f"remote-settings.json (no refetch overwrite).")
+
+
+@policy_group.command("set")
+@click.argument("name", required=False, default=None)
+@click.option("--file", "-f", "settings_file", required=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="JSON file with the managed settings object to serve.")
+def policy_set(name: Optional[str], settings_file: str) -> None:
+    """Serve your own managed settings for a profile (serve 200)."""
+    from claudex.core.policy import set_policy
+    name = _resolve_policy_profile(name)
+    try:
+        settings = json.loads(Path(settings_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        console.print(f"[red]Error:[/red] could not read JSON from {settings_file}: {e}")
+        sys.exit(1)
+    if not isinstance(settings, dict):
+        console.print("[red]Error:[/red] settings file must contain a JSON object.")
+        sys.exit(1)
+    set_policy(name, "set", settings)
+    keys = sorted(settings.keys())
+    console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will apply your managed "
+                  f"settings ({len(keys)} key(s): {', '.join(keys) or '∅'}).")
+
+
+@policy_group.command("off")
+@click.argument("name", required=False, default=None)
+def policy_off(name: Optional[str]) -> None:
+    """Disable the local override; Claude Code uses the real backend again."""
+    from claudex.core.policy import set_policy
+    name = _resolve_policy_profile(name)
+    set_policy(name, "off")
+    console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] back to the real "
+                  f"backend for managed settings.")
 
 
 # ─── Config commands ──────────────────────────────────────────────────────────
