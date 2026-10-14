@@ -1,4 +1,4 @@
 """claudex — Cross-platform Claude Code profile manager and session switcher."""
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __app_name__ = "claudex"
