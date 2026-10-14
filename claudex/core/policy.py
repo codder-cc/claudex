@@ -70,7 +70,7 @@ BUILTIN_TEMPLATES: dict[str, dict] = {
 }
 
 #: Bump when the shim source below changes so ``ensure_shim`` rewrites it.
-SHIM_VERSION = 2
+SHIM_VERSION = 3
 SHIM_NAME = "remote-settings-shim.cjs"
 
 VALID_MODES = ("off", "reject", "freeze", "set")
@@ -241,6 +241,9 @@ def ensure_shim(shim_dir: Path = SHIM_DIR) -> Path:
 
 REMOTE_SETTINGS_NAME = "remote-settings.json"
 REMOTE_SETTINGS_BACKUP = "remote-settings.json.claudex-bak"
+# Epoch-ms sidecar Claude Code writes on each sync; bumping it to "now" marks the
+# cache fresh so a background re-sync won't re-download and clobber our override.
+REMOTE_SETTINGS_SYNCED_AT = "remote-settings.json.synced-at"
 
 
 def remote_settings_path(config_dir: Path) -> Path:
@@ -294,12 +297,21 @@ def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> 
             remote.chmod(0o600)
         except OSError:
             pass
+        # Mark the cache freshly synced so a background re-sync defers and does
+        # not re-download the org policy over our file.
+        synced_at = None
+        try:
+            synced_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+            (config_dir / REMOTE_SETTINGS_SYNCED_AT).write_text(str(synced_at), encoding="utf-8")
+        except OSError:
+            synced_at = None
         return {
             "wrote": True,
             "path": str(remote),
             "keys": sorted(payload.keys()),
             "removed_deny": removed_deny,
             "backed_up": backup.exists(),
+            "synced_at": synced_at,
         }
     except OSError:
         return None
@@ -313,6 +325,11 @@ def restore_remote_file(config_dir: Path) -> bool:
     """
     remote = remote_settings_path(config_dir)
     backup = config_dir / REMOTE_SETTINGS_BACKUP
+    # Drop our freshness stamp so Claude Code re-syncs the authoritative policy.
+    try:
+        (config_dir / REMOTE_SETTINGS_SYNCED_AT).unlink(missing_ok=True)
+    except OSError:
+        pass
     try:
         if backup.exists():
             remote.write_bytes(backup.read_bytes())
@@ -443,7 +460,7 @@ def augment_env(
 # The shim (Node CommonJS, loaded via --require before Claude Code's bundle)
 # ---------------------------------------------------------------------------
 
-_SHIM_SOURCE = r'''// claudex-policy-shim v2
+_SHIM_SOURCE = r'''// claudex-policy-shim v3
 'use strict';
 //
 // Intercepts ONLY `GET <host>/api/claude_code/settings` and answers it from a
@@ -464,7 +481,9 @@ const { EventEmitter } = require('events');
 const STATE_FILE = process.env.CLAUDEX_POLICY_FILE;
 const LOG_FILE = process.env.CLAUDEX_POLICY_LOG;
 const DEBUG = process.env.CLAUDEX_POLICY_DEBUG === '1';
-const TARGET_PATH = '/api/claude_code/settings';
+// Both the legacy and the 2.1.x managed-settings pull endpoints.
+const TARGET_PATHS = ['/api/claude_code/settings', '/managed/settings'];
+function isTargetPath(p) { return TARGET_PATHS.indexOf(p) !== -1; }
 
 function log() {
   if (!DEBUG) return;
@@ -607,11 +626,12 @@ function makeWrapper(original, autoEnd) {
     const args = [].slice.call(arguments);
     try {
       const plan = planResponse();
-      if (plan && pathOf(args) === TARGET_PATH && methodOf(args) === 'GET') {
-        log('intercept GET', TARGET_PATH, '->', plan.status);
+      const reqPath = pathOf(args);
+      if (plan && isTargetPath(reqPath) && methodOf(args) === 'GET') {
+        log('intercept GET', reqPath, '->', plan.status);
         logRecord({
           event: 'settings_intercept',
-          path: TARGET_PATH,
+          path: reqPath,
           mode: plan.mode,
           status: plan.status,
           served_keys: plan.servedKeys,

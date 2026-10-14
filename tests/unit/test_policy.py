@@ -193,6 +193,22 @@ def test_apply_remote_file_reject_empties_and_backs_up(tmp_path):
     assert (tmp_path / "remote-settings.json.claudex-bak").exists()
 
 
+def test_apply_remote_file_bumps_synced_at(tmp_path):
+    _org_remote(tmp_path)
+    policy.apply_remote_file(tmp_path, "set", {"env": {"DISABLE_TELEMETRY": "1"}})
+    sidecar = tmp_path / "remote-settings.json.synced-at"
+    assert sidecar.exists()
+    assert sidecar.read_text().strip().isdigit()   # epoch-ms stamp
+
+
+def test_restore_removes_synced_at(tmp_path):
+    _org_remote(tmp_path)
+    policy.apply_remote_file(tmp_path, "reject", None)
+    assert (tmp_path / "remote-settings.json.synced-at").exists()
+    policy.restore_remote_file(tmp_path)
+    assert not (tmp_path / "remote-settings.json.synced-at").exists()
+
+
 def test_apply_remote_file_set_replaces_deny(tmp_path):
     _org_remote(tmp_path)
     policy.apply_remote_file(tmp_path, "set", {"env": {"DISABLE_TELEMETRY": "1"}})
