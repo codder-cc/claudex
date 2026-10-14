@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,13 @@ from claudex.constants import CLAUDEX_HOME
 POLICY_DIR = CLAUDEX_HOME / "policy"          # per-profile state files
 SHIM_DIR = CLAUDEX_HOME / "shim"              # the Node preload shim lives here
 TEMPLATES_DIR = POLICY_DIR / "templates"      # user-defined policy templates (*.json)
+LOGS_DIR = POLICY_DIR / "logs"                # per-profile activity logs (*.log, JSONL)
+
+#: Privacy-related env vars. When a policy's served settings carry these in their
+#: ``env`` block, claudex also injects them straight into the launched process
+#: env — so telemetry is suppressed reliably, independent of whether Claude Code
+#: considers the account eligible for remote managed settings.
+PRIVACY_ENV_VARS = ("DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
 
 #: Built-in policy templates — ready-made managed-settings payloads you can drop
 #: in with `claudex policy default` / `--template` instead of hand-writing JSON.
@@ -62,7 +70,7 @@ BUILTIN_TEMPLATES: dict[str, dict] = {
 }
 
 #: Bump when the shim source below changes so ``ensure_shim`` rewrites it.
-SHIM_VERSION = 1
+SHIM_VERSION = 2
 SHIM_NAME = "remote-settings-shim.cjs"
 
 VALID_MODES = ("off", "reject", "freeze", "set")
@@ -229,30 +237,97 @@ def _require_flag(shim: Path) -> str:
     return f'--require "{shim}"'
 
 
+def log_path(profile: str, logs_dir: Path = LOGS_DIR) -> Path:
+    return logs_dir / f"{profile}.log"
+
+
+def append_log(profile: str, record: dict, logs_dir: Path = LOGS_DIR) -> None:
+    """Append one JSONL record to the profile's policy activity log (best-effort)."""
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), **record}
+        with log_path(profile, logs_dir).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def read_log(profile: str, lines: int = 50, logs_dir: Path = LOGS_DIR) -> list[dict]:
+    """Return the last *lines* parsed JSONL records from the profile's log."""
+    try:
+        raw = log_path(profile, logs_dir).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for ln in raw[-lines:]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def clear_log(profile: str, logs_dir: Path = LOGS_DIR) -> None:
+    try:
+        log_path(profile, logs_dir).unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
 def augment_env(
     env: dict,
     profile: str,
     policy_dir: Path = POLICY_DIR,
     shim_dir: Path = SHIM_DIR,
+    logs_dir: Path = LOGS_DIR,
 ) -> dict:
     """Augment *env* in place so the launched ``claude`` applies *profile*'s policy.
 
-    No-op (env returned unchanged) when the profile's mode is ``off``. Otherwise
-    installs the shim, appends ``--require <shim>`` to ``NODE_OPTIONS`` (preserving
-    anything already there), and points the shim at the profile's state file.
+    No-op (env returned unchanged) when the profile's mode is ``off``. Otherwise:
+      * installs the shim and appends ``--require <shim>`` to ``NODE_OPTIONS``
+        (preserving anything already there);
+      * points the shim at the profile's state file and a per-profile log file;
+      * for ``set`` policies, injects any PRIVACY_ENV_VARS from the served
+        settings straight into the launch env (telemetry off regardless of
+        remote-settings eligibility);
+      * records a ``launch`` entry in the activity log for later inspection.
     """
-    mode = get_policy(profile, policy_dir).get("mode", "off")
+    pol = get_policy(profile, policy_dir)
+    mode = pol.get("mode", "off")
     if mode not in ACTIVE_MODES:
         return env
 
-    flag = _require_flag(ensure_shim(shim_dir))
+    shim = ensure_shim(shim_dir)
+    flag = _require_flag(shim)
     existing = env.get("NODE_OPTIONS", "")
     if flag not in existing:
         env["NODE_OPTIONS"] = f"{existing} {flag}".strip() if existing else flag
     env["CLAUDEX_POLICY_FILE"] = str(_state_path(profile, policy_dir))
+    env["CLAUDEX_POLICY_LOG"] = str(log_path(profile, logs_dir))
     # Opt-in stderr tracing from the shim, mirroring the parent's env.
     if os.environ.get("CLAUDEX_POLICY_DEBUG") == "1":
         env["CLAUDEX_POLICY_DEBUG"] = "1"
+
+    # Belt-and-suspenders privacy: push telemetry kill-switches directly into the
+    # launch env (not only via the served managed settings, which only apply when
+    # eligible). Only a small, known-safe allowlist is forwarded.
+    injected: dict[str, str] = {}
+    served_env = ((pol.get("settings") or {}).get("env") or {}) if mode == "set" else {}
+    for key in PRIVACY_ENV_VARS:
+        if key in served_env:
+            env[key] = str(served_env[key])
+            injected[key] = str(served_env[key])
+
+    append_log(profile, {
+        "event": "launch",
+        "mode": mode,
+        "label": pol.get("label"),
+        "shim": str(shim),
+        "injected_env": injected,
+    }, logs_dir)
     return env
 
 
@@ -260,13 +335,16 @@ def augment_env(
 # The shim (Node CommonJS, loaded via --require before Claude Code's bundle)
 # ---------------------------------------------------------------------------
 
-_SHIM_SOURCE = r'''// claudex-policy-shim v1
+_SHIM_SOURCE = r'''// claudex-policy-shim v2
 'use strict';
 //
 // Intercepts ONLY `GET <host>/api/claude_code/settings` and answers it from a
 // claudex per-profile state file, letting you reject or override Claude Code's
 // remote managed settings locally. Every other request passes through. Any
 // error here falls back to the original request (fail-open).
+//
+// When CLAUDEX_POLICY_LOG points at a file, every interception is appended there
+// as a JSON line so you can confirm the override actually ran.
 //
 const http = require('http');
 const https = require('https');
@@ -276,12 +354,20 @@ const { Readable } = require('stream');
 const { EventEmitter } = require('events');
 
 const STATE_FILE = process.env.CLAUDEX_POLICY_FILE;
+const LOG_FILE = process.env.CLAUDEX_POLICY_LOG;
 const DEBUG = process.env.CLAUDEX_POLICY_DEBUG === '1';
 const TARGET_PATH = '/api/claude_code/settings';
 
 function log() {
   if (!DEBUG) return;
   try { console.error.apply(console, ['[claudex-policy]'].concat([].slice.call(arguments))); } catch (e) {}
+}
+
+function logRecord(obj) {
+  if (!LOG_FILE) return;
+  try {
+    fs.appendFileSync(LOG_FILE, JSON.stringify(Object.assign({ ts: new Date().toISOString() }, obj)) + '\n');
+  } catch (e) { log('log write failed:', e && e.message); }
 }
 
 function readState() {
@@ -315,10 +401,10 @@ function planResponse() {
   switch (st.mode) {
     case 'reject':
       // 204 → Claude Code treats it as "no managed settings" and clears cache.
-      return { status: 204, message: 'No Content', headers: {} };
+      return { status: 204, message: 'No Content', headers: {}, mode: 'reject', servedKeys: [] };
     case 'freeze':
       // 304 → Claude Code keeps the remote-settings.json already on disk.
-      return { status: 304, message: 'Not Modified', headers: {} };
+      return { status: 304, message: 'Not Modified', headers: {}, mode: 'freeze', servedKeys: [] };
     case 'set': {
       const settings = (st.settings && typeof st.settings === 'object') ? st.settings : {};
       const body = JSON.stringify({
@@ -331,6 +417,8 @@ function planResponse() {
         message: 'OK',
         body: body,
         headers: { 'content-type': 'application/json' },
+        mode: 'set',
+        servedKeys: Object.keys(settings),
       };
     }
     default:
@@ -413,6 +501,13 @@ function makeWrapper(original, autoEnd) {
       const plan = planResponse();
       if (plan && pathOf(args) === TARGET_PATH && methodOf(args) === 'GET') {
         log('intercept GET', TARGET_PATH, '->', plan.status);
+        logRecord({
+          event: 'settings_intercept',
+          path: TARGET_PATH,
+          mode: plan.mode,
+          status: plan.status,
+          served_keys: plan.servedKeys,
+        });
         const req = new FakeClientRequest(plan, callbackOf(args));
         if (autoEnd) process.nextTick(function () { req.end(); });
         return req;

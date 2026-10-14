@@ -140,10 +140,36 @@ def test_augment_env_noop_when_off(tmp_path):
 def test_augment_env_installs_shim_for_reject(tmp_path):
     policy.set_policy("work", "reject", policy_dir=tmp_path)
     env: dict = {}
-    policy.augment_env(env, "work", policy_dir=tmp_path, shim_dir=tmp_path / "shim")
+    policy.augment_env(env, "work", policy_dir=tmp_path, shim_dir=tmp_path / "shim",
+                       logs_dir=tmp_path / "logs")
     assert "--require" in env["NODE_OPTIONS"]
     assert env["CLAUDEX_POLICY_FILE"] == str(tmp_path / "work.json")
+    assert env["CLAUDEX_POLICY_LOG"] == str(tmp_path / "logs" / "work.log")
     assert (tmp_path / "shim" / policy.SHIM_NAME).exists()
+
+
+def test_augment_env_logs_launch_and_injects_privacy_env(tmp_path):
+    # A 'set' policy whose settings disable telemetry → claudex injects it directly.
+    policy.set_policy("work", "set", {"env": {"DISABLE_TELEMETRY": "1"}},
+                      policy_dir=tmp_path, label="template:default")
+    env: dict = {}
+    policy.augment_env(env, "work", policy_dir=tmp_path, shim_dir=tmp_path / "shim",
+                       logs_dir=tmp_path / "logs")
+    # Privacy env pushed straight into the launch env (eligibility-independent).
+    assert env["DISABLE_TELEMETRY"] == "1"
+    # Launch recorded in the activity log.
+    recs = policy.read_log("work", logs_dir=tmp_path / "logs")
+    assert recs and recs[-1]["event"] == "launch"
+    assert recs[-1]["injected_env"] == {"DISABLE_TELEMETRY": "1"}
+    assert recs[-1]["mode"] == "set"
+
+
+def test_read_log_empty_and_clear(tmp_path):
+    assert policy.read_log("work", logs_dir=tmp_path) == []
+    policy.append_log("work", {"event": "x"}, logs_dir=tmp_path)
+    assert len(policy.read_log("work", logs_dir=tmp_path)) == 1
+    policy.clear_log("work", logs_dir=tmp_path)
+    assert policy.read_log("work", logs_dir=tmp_path) == []
 
 
 def test_augment_env_preserves_existing_node_options(tmp_path):
@@ -200,7 +226,11 @@ def _run_shim(tmp_path, mode, settings=None):
           console.log(JSON.stringify({ settings, other }));
         })();
     """), encoding="utf-8")
-    env = {**os.environ, "CLAUDEX_POLICY_FILE": str(tmp_path / "p.json")}
+    env = {
+        **os.environ,
+        "CLAUDEX_POLICY_FILE": str(tmp_path / "p.json"),
+        "CLAUDEX_POLICY_LOG": str(tmp_path / "p.log"),
+    }
     proc = subprocess.run(
         [_NODE, "--require", str(shim), str(harness)],
         env=env, capture_output=True, text=True, timeout=30,
@@ -232,3 +262,13 @@ def test_shim_set_returns_200_with_settings(tmp_path):
 def test_shim_freeze_returns_304(tmp_path):
     out = _run_shim(tmp_path, "freeze")
     assert out["settings"]["status"] == 304
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not installed")
+def test_shim_writes_intercept_log(tmp_path):
+    _run_shim(tmp_path, "reject")
+    logged = [json.loads(l) for l in
+              (tmp_path / "p.log").read_text(encoding="utf-8").splitlines() if l.strip()]
+    intercepts = [r for r in logged if r.get("event") == "settings_intercept"]
+    assert intercepts and intercepts[-1]["status"] == 204
+    assert intercepts[-1]["mode"] == "reject"

@@ -1002,6 +1002,44 @@ def policy_show(name: Optional[str]) -> None:
         console.print(f"  settings keys: {', '.join(keys) if keys else '(empty object)'}")
 
 
+@policy_group.command("log")
+@click.argument("name", required=False, default=None)
+@click.option("--lines", "-n", default=20, show_default=True,
+              help="How many recent entries to show.")
+@click.option("--clear", is_flag=True, help="Clear the log instead of showing it.")
+def policy_log(name: Optional[str], lines: int, clear: bool) -> None:
+    """Show the shim's activity report for a profile (launches + interceptions)."""
+    from claudex.core.policy import read_log, clear_log, log_path
+    name = _resolve_policy_profile(name)
+    if clear:
+        clear_log(name)
+        console.print(f"[green]✓[/green] Cleared policy log for [bold]{name}[/bold].")
+        return
+    records = read_log(name, lines=lines)
+    if not records:
+        console.print(f"No policy activity logged for [bold]{name}[/bold] yet.")
+        console.print(f"[dim]Log file: {log_path(name)}[/dim]")
+        console.print("[dim]Launch the profile with an active policy, then re-run this.[/dim]")
+        return
+    console.print(f"[bold]Policy activity for {name}[/bold] (last {len(records)}):")
+    for r in records:
+        ts = str(r.get("ts", ""))[:19].replace("T", " ")
+        ev = r.get("event")
+        if ev == "launch":
+            inj = r.get("injected_env") or {}
+            inj_s = ", ".join(f"{k}={v}" for k, v in inj.items()) or "none"
+            console.print(f"  [dim]{ts}[/dim] [cyan]launch[/cyan] "
+                          f"mode={r.get('mode')} label={r.get('label') or '-'} "
+                          f"privacy_env=[{inj_s}]")
+        elif ev == "settings_intercept":
+            keys = ", ".join(r.get("served_keys") or []) or "∅"
+            console.print(f"  [dim]{ts}[/dim] [green]intercept[/green] "
+                          f"GET settings → [bold]{r.get('status')}[/bold] "
+                          f"(mode={r.get('mode')}, served=[{keys}])")
+        else:
+            console.print(f"  [dim]{ts}[/dim] {ev} {r}")
+
+
 @policy_group.command("templates")
 def policy_templates() -> None:
     """List available policy templates (built-in + your own)."""
