@@ -927,9 +927,12 @@ def internal_restore_hook(name: str) -> None:
 @click.option("--install-hook/--no-install-hook", default=True,
               help="Install the /switch hook into each profile's settings.json "
                    "(restored on exit). On by default.")
+@click.option("--proxy/--no-proxy", "proxy", default=None,
+              help="Force proxy mode on/off for this run, overriding the "
+                   "profile's stored `policy proxy` setting.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def run_supervisor(name: str, dry_run: bool, timeout: Optional[float],
-                   install_hook: bool, claude_args: tuple) -> None:
+                   install_hook: bool, proxy: Optional[bool], claude_args: tuple) -> None:
     """Run claude under a supervisor that applies in-session profile switches.
 
     Live mode (default): hosts claude under NAME; when you type
@@ -956,7 +959,8 @@ def run_supervisor(name: str, dry_run: bool, timeout: Optional[float],
             console.print(f"  Plan: {plan.describe()}")
             console.print(f"  Command: [cyan]{' '.join(plan.cmd)}[/cyan]")
             return
-        sup = Supervisor(name, extra_args=list(claude_args), install_hook=install_hook)
+        sup = Supervisor(name, extra_args=list(claude_args), install_hook=install_hook,
+                         proxy_override=proxy)
         console.print(f"[cyan]Launching claude under profile [bold]{name}[/bold] "
                       f"(supervisor). Type [bold]switch <profile>[/bold] "
                       f"(a plain message, no slash) to switch.[/cyan]")
@@ -1231,7 +1235,8 @@ def policy_off(name: Optional[str]) -> None:
 
 
 @cli.command("proxy")
-@click.option("--port", "-p", default=8787, show_default=True, help="Local port to listen on.")
+@click.option("--port", "-p", default=0, show_default="auto (free port)",
+              help="Local port to listen on (0 = pick a free one).")
 @click.option("--host", default="127.0.0.1", show_default=True, help="Local bind address.")
 def proxy_cmd(port: int, host: str) -> None:
     """Run a local reverse proxy to api.anthropic.com.
@@ -1242,24 +1247,32 @@ def proxy_cmd(port: int, host: str) -> None:
     \b
       # terminal 1
       claudex proxy
-      # terminal 2
+      # terminal 2 (use the printed URL)
       CLAUDE_CONFIG_DIR=~/.claudex/profiles/<name> \\
-        ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+        ANTHROPIC_BASE_URL=http://127.0.0.1:<port> claude
 
-    Only works where the org policy is fail-open (an org that *requires* managed
-    settings blocks startup when the gateway is unreachable — not overridable
-    locally by design).
+    Usually you don't run this by hand — `claudex policy proxy <name>` then
+    `claudex run <name>` (or `run --proxy`) does it automatically. Only works
+    where the org policy is fail-open (an org that *requires* managed settings
+    blocks startup when the gateway is unreachable — not overridable locally).
     """
-    from claudex.core.proxy import serve_forever
-    console.print(f"[cyan]claudex proxy[/cyan] → forwarding "
-                  f"[bold]http://{host}:{port}[/bold] to [bold]api.anthropic.com[/bold]")
-    console.print(f"  Set [cyan]ANTHROPIC_BASE_URL=http://{host}:{port}[/cyan] for the profile.")
-    console.print("  [dim]Ctrl+C to stop.[/dim]")
+    from claudex.core.proxy import make_server, base_url_for
     try:
-        serve_forever(host, port)
+        server = make_server(host, port)
     except OSError as e:
         console.print(f"[red]Error:[/red] could not bind {host}:{port}: {e}")
         sys.exit(1)
+    base = base_url_for(server)
+    console.print(f"[cyan]claudex proxy[/cyan] → forwarding [bold]{base}[/bold] "
+                  f"to [bold]api.anthropic.com[/bold]")
+    console.print(f"  Set [cyan]ANTHROPIC_BASE_URL={base}[/cyan] for the profile.")
+    console.print("  [dim]Ctrl+C to stop.[/dim]")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
 
 
 # ─── Config commands ──────────────────────────────────────────────────────────

@@ -308,6 +308,7 @@ class Supervisor:
         supervisor_file: Path = SUPERVISOR_FILE,
         claude_bin: str = CLAUDE_BIN,
         install_hook: bool = True,
+        proxy_override: Optional[bool] = None,
     ) -> None:
         validate_profile_name(profile_name)
         self.pm = pm or ProfileManager()
@@ -327,6 +328,8 @@ class Supervisor:
         self._shutdown = False
         self._proxy_server = None          # local api.anthropic.com proxy (lazy)
         self._proxy_base: Optional[str] = None
+        # None → honor each profile's stored flag; True/False → force for this run.
+        self._proxy_override = proxy_override
 
     # -- liveness --------------------------------------------------------
     def _write_liveness(self) -> None:
@@ -432,7 +435,10 @@ class Supervisor:
         """Return the local-proxy base URL for *profile*, starting the proxy once
         (shared across relaunches/switches) if proxy mode is enabled."""
         from claudex.core.policy import proxy_enabled
-        if not proxy_enabled(profile):
+        want = self._proxy_override
+        if want is None:
+            want = proxy_enabled(profile)
+        if not want:
             return None
         if self._proxy_server is None:
             from claudex.core.proxy import start_background

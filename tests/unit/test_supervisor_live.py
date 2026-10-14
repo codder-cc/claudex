@@ -167,3 +167,29 @@ def test_live_loop_natural_exit_no_switch(env, tmp_path):
     rc = sup.run()
     assert rc == 7
     assert not (tmp_path / ".supervisor").exists()
+
+
+def test_proxy_override_controls_base_url(env):
+    """proxy_override forces the local proxy on/off regardless of the stored flag."""
+    from claudex.core.supervisor import Supervisor
+    from claudex.core import policy
+    tmp_path, pm = env
+    pm.create("incr")
+
+    # override=True → proxy starts, ANTHROPIC_BASE_URL points at it
+    sup = Supervisor("incr", pm=pm, proxy_override=True, install_hook=False)
+    try:
+        base = sup._proxy_base_for("incr")
+        assert base and base.startswith("http://127.0.0.1:")
+        env2 = sup._env_for(str(pm.get("incr").config_dir), "incr")
+        assert env2["ANTHROPIC_BASE_URL"] == base
+    finally:
+        sup._stop_proxy()
+
+    # override=False → no proxy even if the profile flag is on
+    policy.set_proxy("incr", True, policy_dir=tmp_path / "policy")
+    sup2 = Supervisor("incr", pm=pm, proxy_override=False, install_hook=False)
+    try:
+        assert sup2._proxy_base_for("incr") is None
+    finally:
+        sup2._stop_proxy()
