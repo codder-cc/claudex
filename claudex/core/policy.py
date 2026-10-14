@@ -247,13 +247,30 @@ def remote_settings_path(config_dir: Path) -> Path:
     return config_dir / REMOTE_SETTINGS_NAME
 
 
-def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> Optional[str]:
+def _deny_count(obj: object) -> int:
+    try:
+        deny = (obj or {}).get("permissions", {}).get("deny", [])  # type: ignore[union-attr]
+        return len(deny) if isinstance(deny, list) else 0
+    except AttributeError:
+        return 0
+
+
+def read_remote_file(config_dir: Path) -> Optional[dict]:
+    """Return the parsed on-disk remote-settings.json, or None if absent/unreadable."""
+    try:
+        data = json.loads(remote_settings_path(config_dir).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> Optional[dict]:
     """Rewrite ``config_dir/remote-settings.json`` to match the active policy.
 
     Backs up the org-pushed file once (``*.claudex-bak``) before the first
     overwrite. ``reject`` → ``{}`` (no managed policy), ``set`` → the served
-    settings, ``freeze`` → left untouched. Returns a short action string for the
-    activity log, or ``None`` if nothing was written.
+    settings, ``freeze`` → left untouched. Returns a dict describing the action
+    (for the activity log), or ``None`` if nothing was written.
     """
     remote = remote_settings_path(config_dir)
     backup = config_dir / REMOTE_SETTINGS_BACKUP
@@ -266,6 +283,8 @@ def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> 
     else:
         return None
     try:
+        before = read_remote_file(config_dir)
+        removed_deny = _deny_count(before)
         config_dir.mkdir(parents=True, exist_ok=True)
         # Preserve the original org policy once, so `policy off` can restore it.
         if remote.exists() and not backup.exists():
@@ -275,7 +294,13 @@ def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> 
             remote.chmod(0o600)
         except OSError:
             pass
-        return f"wrote {REMOTE_SETTINGS_NAME} ({'empty' if not payload else ','.join(sorted(payload))})"
+        return {
+            "wrote": True,
+            "path": str(remote),
+            "keys": sorted(payload.keys()),
+            "removed_deny": removed_deny,
+            "backed_up": backup.exists(),
+        }
     except OSError:
         return None
 

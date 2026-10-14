@@ -1001,6 +1001,20 @@ def policy_show(name: Optional[str]) -> None:
         keys = sorted((pol.get("settings") or {}).keys())
         console.print(f"  settings keys: {', '.join(keys) if keys else '(empty object)'}")
 
+    # Live state of the on-disk managed file (what Claude Code actually reads).
+    from claudex.core.policy import read_remote_file, _deny_count, REMOTE_SETTINGS_BACKUP
+    cfg = _pm().get(name).config_dir
+    live = read_remote_file(cfg)
+    rpath = cfg / "remote-settings.json"
+    if live is None:
+        console.print(f"  on-disk remote-settings.json: [dim]absent[/dim] ({rpath})")
+    else:
+        dc = _deny_count(live)
+        deny_s = (f"[red]{dc} deny rule(s)[/red]" if dc else "[green]no deny rules[/green]")
+        console.print(f"  on-disk remote-settings.json: keys={sorted(live.keys()) or '∅'}, {deny_s}")
+    if (cfg / REMOTE_SETTINGS_BACKUP).exists():
+        console.print(f"  [dim]org backup kept → `claudex policy off {name}` restores it[/dim]")
+
 
 @policy_group.command("log")
 @click.argument("name", required=False, default=None)
@@ -1028,9 +1042,18 @@ def policy_log(name: Optional[str], lines: int, clear: bool) -> None:
         if ev == "launch":
             inj = r.get("injected_env") or {}
             inj_s = ", ".join(f"{k}={v}" for k, v in inj.items()) or "none"
+            rf = r.get("remote_file")
+            if isinstance(rf, dict) and rf.get("wrote"):
+                rd = rf.get("removed_deny") or 0
+                keys = ", ".join(rf.get("keys") or []) or "∅"
+                rf_s = f"wrote remote-settings.json keys=[{keys}]" + (
+                    f", stripped {rd} deny rule(s)" if rd else "")
+            else:
+                rf_s = "no file write"
             console.print(f"  [dim]{ts}[/dim] [cyan]launch[/cyan] "
                           f"mode={r.get('mode')} label={r.get('label') or '-'} "
                           f"privacy_env=[{inj_s}]")
+            console.print(f"           [dim]↳ {rf_s}[/dim]")
         elif ev == "settings_intercept":
             keys = ", ".join(r.get("served_keys") or []) or "∅"
             console.print(f"  [dim]{ts}[/dim] [green]intercept[/green] "

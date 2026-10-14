@@ -228,9 +228,12 @@ def test_augment_env_rewrites_remote_file_and_logs(tmp_path):
     # remote file rewritten → no deny
     data = json.loads((cfg / "remote-settings.json").read_text())
     assert "permissions" not in data and data["env"]["DISABLE_TELEMETRY"] == "1"
-    # logged the file action
+    # logged the file action (now a structured record)
     rec = policy.read_log("work", logs_dir=tmp_path / "logs")[-1]
-    assert rec["remote_file"] and "remote-settings.json" in rec["remote_file"]
+    rf = rec["remote_file"]
+    assert rf["wrote"] is True
+    assert rf["removed_deny"] == 1          # the simulated org deny was stripped
+    assert rf["keys"] == ["env"]
 
 
 def test_augment_env_preserves_existing_node_options(tmp_path):
