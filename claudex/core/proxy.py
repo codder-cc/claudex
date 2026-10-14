@@ -101,18 +101,24 @@ class AsyncProxyServer:
         self.server_address = self._server.sockets[0].getsockname()[:2]
 
     # -- upstream keep-alive pool (single loop → no lock needed) --------------
+    async def _open_upstream(self):
+        return await asyncio.open_connection(
+            self.upstream_host, self.upstream_port,
+            ssl=self._ssl, server_hostname=self.upstream_host)
+
     async def _acquire_upstream(self):
+        """Return (reader, writer, from_pool). A pooled connection may be silently
+        dead (network/VPN flap) — the caller retries once on a fresh one."""
         while self._pool:
             reader, writer = self._pool.pop()
             if not writer.is_closing():
-                return reader, writer
+                return reader, writer, True
             try:
                 writer.close()
             except Exception:  # noqa: BLE001
                 pass
-        return await asyncio.open_connection(
-            self.upstream_host, self.upstream_port,
-            ssl=self._ssl, server_hostname=self.upstream_host)
+        reader, writer = await self._open_upstream()
+        return reader, writer, False
 
     def _release_upstream(self, reader, writer) -> None:
         if len(self._pool) < _MAX_POOL and not writer.is_closing():
@@ -132,6 +138,112 @@ class AsyncProxyServer:
         text = data[:-4].decode("latin-1")
         start_line = text.split("\r\n", 1)[0]
         return start_line, _header_lines(text)
+
+    async def _read_body_raw(self, reader, hdr: dict) -> Optional[bytes]:
+        """Buffer a request body (small: JSON prompt) as raw wire bytes so the
+        request can be re-sent if a stale pooled connection fails. Returns None
+        if the client disconnects mid-body."""
+        te = hdr.get("transfer-encoding", "").lower()
+        if "chunked" in te:
+            buf = bytearray()
+            while True:
+                line = await reader.readline()
+                if not line:
+                    return None
+                buf += line
+                try:
+                    size = int(line.strip().split(b";")[0].decode("latin-1") or "0", 16)
+                except ValueError:
+                    return None
+                if size == 0:
+                    while True:
+                        t = await reader.readline()
+                        buf += t
+                        if t in (b"\r\n", b"\n", b""):
+                            break
+                    return bytes(buf)
+                try:
+                    buf += await reader.readexactly(size + 2)
+                except asyncio.IncompleteReadError:
+                    return None
+        cl = hdr.get("content-length")
+        if cl is not None:
+            try:
+                n = int(cl)
+            except ValueError:
+                n = 0
+            if n <= 0:
+                return b""
+            try:
+                return await reader.readexactly(n)
+            except asyncio.IncompleteReadError:
+                return None
+        return b""
+
+    def _build_request(self, method, path, req_headers, body: bytes) -> bytes:
+        out = [f"{method} {path} HTTP/1.1\r\n".encode("latin-1"),
+               f"Host: {self.upstream_host}\r\n".encode("latin-1")]
+        for name, value in req_headers:
+            low = name.lower()
+            if low in _HOP_BY_HOP or low == "host":
+                continue
+            out.append(f"{name}: {value}\r\n".encode("latin-1"))
+        out.append(b"\r\n")
+        out.append(body)
+        return b"".join(out)
+
+    async def _send_with_retry(self, req_bytes: bytes):
+        """Send the buffered request, retrying ONCE on a fresh connection only if
+        a *pooled* (reused) connection failed before any response byte — the
+        request never reached the server, so a single retry is safe. A fresh
+        connection failing means the network is down: give up (never hammer the
+        API). Returns (reader, writer, resp_head) or (None, None, None)."""
+        try:
+            reader, writer, from_pool = await self._acquire_upstream()
+        except (ConnectionError, OSError):
+            return None, None, None   # cannot open a connection → network down
+        try:
+            writer.write(req_bytes)
+            await writer.drain()
+            head = await self._read_head(reader)
+            if head is not None:
+                return reader, writer, head
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if not from_pool:
+            return None, None, None   # fresh conn failed → network down, don't retry
+        # Stale pooled connection → one retry on a brand-new connection.
+        try:
+            reader, writer = await self._open_upstream()
+            writer.write(req_bytes)
+            await writer.drain()
+            head = await self._read_head(reader)
+            if head is not None:
+                return reader, writer, head
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
+        return None, None, None
+
+    @staticmethod
+    async def _send_error(writer, code: int, reason: str, message: str) -> None:
+        body = json.dumps({"type": "error",
+                           "error": {"type": "api_error", "message": message}}).encode()
+        try:
+            writer.write(f"HTTP/1.1 {code} {reason}\r\n".encode("latin-1"))
+            writer.write(b"content-type: application/json\r\n")
+            writer.write(f"content-length: {len(body)}\r\n\r\n".encode("latin-1"))
+            writer.write(body)
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
 
     async def _relay_body(self, reader, writer, hdr: dict, is_request: bool) -> bool:
         """Relay a message body per its framing. Returns True if the body was
@@ -196,23 +308,21 @@ class AsyncProxyServer:
                 return
             method, path = parts[0], parts[1]
 
-            ureader, uwriter = await self._acquire_upstream()
+            # Buffer the (small) request body so a stale pooled connection can be
+            # retried safely without re-reading from the client.
+            body = await self._read_body_raw(creader, _lower(req_headers))
+            if body is None:
+                return  # client vanished mid-body
+            req_bytes = self._build_request(method, path, req_headers, body)
 
-            out = [f"{method} {path} HTTP/1.1\r\n".encode("latin-1"),
-                   f"Host: {self.upstream_host}\r\n".encode("latin-1")]
-            for name, value in req_headers:
-                low = name.lower()
-                if low in _HOP_BY_HOP or low == "host":
-                    continue
-                out.append(f"{name}: {value}\r\n".encode("latin-1"))
-            out.append(b"\r\n")
-            uwriter.write(b"".join(out))
-            await uwriter.drain()
-            await self._relay_body(creader, uwriter, _lower(req_headers), is_request=True)
-
-            rhead = await self._read_head(ureader)
+            ureader, uwriter, rhead = await self._send_with_retry(req_bytes)
             if rhead is None:
+                # Upstream unreachable (network/VPN down) — hand CC a clean 502
+                # instead of a dropped socket, so its own error/retry path runs.
+                await self._send_error(cwriter, 502, "Bad Gateway",
+                                       "claudex proxy: upstream api.anthropic.com unreachable")
                 return
+
             r_start, r_headers = rhead
             cwriter.write((r_start + "\r\n").encode("latin-1"))
             for name, value in r_headers:
@@ -364,25 +474,27 @@ def run_daemon(host: str = "127.0.0.1", port: int = 0) -> None:
     except OSError:
         pass
 
-    def _cleanup(*_a):
+    # Signal handler just stops the loop; serve_forever() then returns and the
+    # daemon exits naturally (no sys.exit from inside the handler, which doesn't
+    # reliably terminate a process blocked in the event loop → orphans).
+    def _stop(*_a):
+        server.shutdown()
+
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None), signal.SIGINT):
+        if sig is not None:
+            try:
+                signal.signal(sig, _stop)
+            except (ValueError, OSError):
+                pass
+    try:
+        server.serve_forever()
+    finally:
         try:
             cur = _read_liveness()
             if cur and int(cur.get("pid", -1)) == os.getpid():
                 PROXY_FILE.unlink(missing_ok=True)
         except OSError:
             pass
-        server.shutdown()
-
-    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None), signal.SIGINT):
-        if sig is not None:
-            try:
-                signal.signal(sig, lambda *_a: (_cleanup(), sys.exit(0)))
-            except (ValueError, OSError):
-                pass
-    try:
-        server.serve_forever()
-    finally:
-        _cleanup()
 
 
 def _claudex_command() -> list[str]:
@@ -397,30 +509,68 @@ def _claudex_command() -> list[str]:
         return [exe] if exe else [sys.executable, "-m", "claudex.cli"]
 
 
+LOCK_FILE = CLAUDEX_HOME / ".proxy.lock"
+
+
+def _spawn_daemon(host: str) -> None:
+    kwargs: dict = {"stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(_claudex_command() + ["proxy", "--daemon", "--host", host], **kwargs)
+
+
 def ensure_shared(host: str = "127.0.0.1", timeout: float = 8.0) -> Optional[str]:
-    """Return the shared daemon's base URL, auto-starting a detached one if needed."""
+    """Return the shared daemon's base URL, auto-starting a detached one if needed.
+
+    Cold start is serialized with a file lock so that many simultaneous launches
+    (e.g. 100 `claude -p` at once with no daemon running) start exactly ONE
+    daemon and all reuse it — never a herd of orphaned proxies.
+    """
     st = status()
     if st["running"]:
         return st["url"]
+
+    lock_fd = None
     try:
-        kwargs: dict = {"stdin": subprocess.DEVNULL,
-                        "stdout": subprocess.DEVNULL,
-                        "stderr": subprocess.DEVNULL}
-        if IS_WINDOWS:
-            kwargs["creationflags"] = 0x00000008 | subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen(_claudex_command() + ["proxy", "--daemon", "--host", host],
-                         **kwargs)
-    except OSError:
-        return None
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+        CLAUDEX_HOME.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o600)
+        if not IS_WINDOWS:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (OSError, ImportError):
+                pass  # best-effort: proceed without the lock
+        # Re-check inside the lock: another launch may have just started it.
         st = status()
         if st["running"]:
             return st["url"]
-        time.sleep(0.15)
-    return None
+        try:
+            _spawn_daemon(host)
+        except OSError:
+            return None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            st = status()
+            if st["running"]:
+                return st["url"]
+            time.sleep(0.15)
+        return None
+    finally:
+        if lock_fd is not None:
+            try:
+                if not IS_WINDOWS:
+                    import fcntl
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (OSError, ImportError):
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def stop_shared() -> bool:

@@ -42,6 +42,37 @@ def test_status_not_running_for_dead_pid(tmp_path, monkeypatch):
     assert proxy.status()["running"] is False
 
 
+def test_502_when_upstream_unreachable():
+    """A dead upstream yields a clean 502 JSON error to the client (not a drop),
+    so Claude Code's own error handling runs — and we never hammer the API."""
+    srv = proxy.make_server(port=0, upstream_host="127.0.0.1", upstream_port=1)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = proxy.base_url_for(srv)
+        req = urllib.request.Request(base + "/v1/messages", method="POST",
+                                     data=b'{"x":1}',
+                                     headers={"content-type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            raise AssertionError("expected a 502")
+        except urllib.error.HTTPError as e:
+            assert e.code == 502
+            assert b"error" in e.read()
+    finally:
+        srv.shutdown()
+
+
+def test_ensure_shared_reuses_running_without_spawning(monkeypatch):
+    """If a daemon is already live, ensure_shared returns it and never spawns."""
+    monkeypatch.setattr(proxy, "status",
+                        lambda: {"running": True, "url": "http://127.0.0.1:40404"})
+    spawned = {"n": 0}
+    monkeypatch.setattr(proxy, "_spawn_daemon", lambda *a, **k: spawned.__setitem__("n", 1))
+    assert proxy.ensure_shared() == "http://127.0.0.1:40404"
+    assert spawned["n"] == 0
+
+
 def test_stop_shared_cleans_file_for_dead_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(proxy, "PROXY_FILE", tmp_path / ".proxy")
     (tmp_path / ".proxy").write_text(json.dumps(
