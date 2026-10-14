@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from claudex.constants import CLAUDEX_HOME
+from claudex.constants import CLAUDEX_HOME, IS_MACOS, IS_LINUX
 
 # ---------------------------------------------------------------------------
 # Layout
@@ -102,10 +102,11 @@ def get_policy(profile: str, policy_dir: Path = POLICY_DIR) -> dict:
                 "mode": data["mode"],
                 "settings": data.get("settings"),
                 "label": data.get("label"),
+                "lock": bool(data.get("lock", False)),
             }
     except (OSError, ValueError, json.JSONDecodeError):
         pass
-    return {"mode": "off", "settings": None, "label": None}
+    return {"mode": "off", "settings": None, "label": None, "lock": False}
 
 
 def set_policy(
@@ -114,18 +115,20 @@ def set_policy(
     settings: Optional[dict] = None,
     policy_dir: Path = POLICY_DIR,
     label: Optional[str] = None,
+    lock: bool = False,
 ) -> dict:
     """Persist the policy for *profile*. ``off`` clears the state file.
 
     For ``set``, *settings* must be a JSON object (the managed-settings payload
     Claude Code will apply). *label* is an optional tag shown by ``show`` (e.g.
-    the template name). Returns the resulting policy dict.
+    the template name). *lock* makes the written remote-settings.json immutable
+    at launch. Returns the resulting policy dict.
     """
     if mode not in VALID_MODES:
         raise ValueError(f"unknown policy mode {mode!r}; expected one of {VALID_MODES}")
     if mode == "off":
         clear_policy(profile, policy_dir)
-        return {"mode": "off", "settings": None, "label": None}
+        return {"mode": "off", "settings": None, "label": None, "lock": False}
     if mode == "set":
         if not isinstance(settings, dict):
             raise ValueError("mode 'set' requires a settings object (dict)")
@@ -133,14 +136,15 @@ def set_policy(
         settings = None
 
     policy_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 1, "mode": mode, "settings": settings, "label": label}
+    payload = {"version": 1, "mode": mode, "settings": settings,
+               "label": label, "lock": bool(lock)}
     path = _state_path(profile, policy_dir)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     try:
         path.chmod(0o600)
     except OSError:
         pass
-    return {"mode": mode, "settings": settings, "label": label}
+    return {"mode": mode, "settings": settings, "label": label, "lock": bool(lock)}
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +186,12 @@ def apply_template(
     name: str,
     policy_dir: Path = POLICY_DIR,
     templates_dir: Path = TEMPLATES_DIR,
+    lock: bool = False,
 ) -> dict:
     """Activate template *name* for *profile* (as a ``set`` policy, labelled)."""
     settings = load_template(name, templates_dir)
-    return set_policy(profile, "set", settings, policy_dir, label=f"template:{name}")
+    return set_policy(profile, "set", settings, policy_dir,
+                      label=f"template:{name}", lock=lock)
 
 
 def clear_policy(profile: str, policy_dir: Path = POLICY_DIR) -> None:
@@ -250,6 +256,45 @@ def remote_settings_path(config_dir: Path) -> Path:
     return config_dir / REMOTE_SETTINGS_NAME
 
 
+def _set_immutable(path: Path, on: bool) -> bool:
+    """Toggle the OS immutable flag on *path* (best-effort).
+
+    macOS: ``chflags uchg/nouchg`` (works as the file's owner). Linux: ``chattr
+    +i/-i`` (usually needs root — fails quietly otherwise). Returns True on
+    success. Used by the ``--lock`` override so Claude Code's background re-sync
+    cannot overwrite our remote-settings.json with the org policy.
+    """
+    import subprocess
+    if not path.exists():
+        return False
+    try:
+        if IS_MACOS:
+            flag = "uchg" if on else "nouchg"
+            r = subprocess.run(["chflags", flag, str(path)],
+                               capture_output=True, timeout=5)
+            return r.returncode == 0
+        if IS_LINUX:
+            flag = "+i" if on else "-i"
+            r = subprocess.run(["chattr", flag, str(path)],
+                               capture_output=True, timeout=5)
+            return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+def is_immutable(path: Path) -> bool:
+    """Best-effort check whether *path* carries the OS immutable flag (macOS)."""
+    try:
+        if IS_MACOS:
+            st = path.stat()
+            # UF_IMMUTABLE == 0x2, exposed via st_flags on macOS.
+            return bool(getattr(st, "st_flags", 0) & 0x2)
+    except OSError:
+        pass
+    return False
+
+
 def _deny_count(obj: object) -> int:
     try:
         deny = (obj or {}).get("permissions", {}).get("deny", [])  # type: ignore[union-attr]
@@ -267,13 +312,16 @@ def read_remote_file(config_dir: Path) -> Optional[dict]:
         return None
 
 
-def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> Optional[dict]:
+def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict],
+                      lock: bool = False) -> Optional[dict]:
     """Rewrite ``config_dir/remote-settings.json`` to match the active policy.
 
     Backs up the org-pushed file once (``*.claudex-bak``) before the first
     overwrite. ``reject`` → ``{}`` (no managed policy), ``set`` → the served
-    settings, ``freeze`` → left untouched. Returns a dict describing the action
-    (for the activity log), or ``None`` if nothing was written.
+    settings, ``freeze`` → left untouched. When *lock* is set, the file is made
+    OS-immutable afterwards so Claude Code's background re-sync can't overwrite
+    it with the org policy. Returns a dict describing the action (for the
+    activity log), or ``None`` if nothing was written.
     """
     remote = remote_settings_path(config_dir)
     backup = config_dir / REMOTE_SETTINGS_BACKUP
@@ -289,6 +337,8 @@ def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> 
         before = read_remote_file(config_dir)
         removed_deny = _deny_count(before)
         config_dir.mkdir(parents=True, exist_ok=True)
+        # Clear any prior immutable flag so we (and the backup copy) can write.
+        _set_immutable(remote, False)
         # Preserve the original org policy once, so `policy off` can restore it.
         if remote.exists() and not backup.exists():
             backup.write_bytes(remote.read_bytes())
@@ -305,6 +355,7 @@ def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> 
             (config_dir / REMOTE_SETTINGS_SYNCED_AT).write_text(str(synced_at), encoding="utf-8")
         except OSError:
             synced_at = None
+        locked = _set_immutable(remote, True) if lock else False
         return {
             "wrote": True,
             "path": str(remote),
@@ -312,6 +363,7 @@ def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> 
             "removed_deny": removed_deny,
             "backed_up": backup.exists(),
             "synced_at": synced_at,
+            "locked": locked,
         }
     except OSError:
         return None
@@ -325,6 +377,8 @@ def restore_remote_file(config_dir: Path) -> bool:
     """
     remote = remote_settings_path(config_dir)
     backup = config_dir / REMOTE_SETTINGS_BACKUP
+    # Clear any immutable lock so the file can be restored/removed.
+    _set_immutable(remote, False)
     # Drop our freshness stamp so Claude Code re-syncs the authoritative policy.
     try:
         (config_dir / REMOTE_SETTINGS_SYNCED_AT).unlink(missing_ok=True)
@@ -433,7 +487,8 @@ def augment_env(
     # remote-settings.json so the managed layer read at launch is ours.
     file_action = None
     if config_dir is not None:
-        file_action = apply_remote_file(Path(config_dir), mode, pol.get("settings"))
+        file_action = apply_remote_file(Path(config_dir), mode, pol.get("settings"),
+                                        lock=pol.get("lock", False))
 
     # Belt-and-suspenders privacy: push telemetry kill-switches directly into the
     # launch env (not only via the served managed settings, which only apply when

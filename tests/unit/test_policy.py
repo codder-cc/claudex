@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
 
 import pytest
@@ -19,7 +20,7 @@ from claudex.core import policy
 
 def test_default_policy_is_off(tmp_path):
     assert policy.get_policy("work", policy_dir=tmp_path) == {
-        "mode": "off", "settings": None, "label": None}
+        "mode": "off", "settings": None, "label": None, "lock": False}
 
 
 def test_set_reject_and_read_back(tmp_path):
@@ -207,6 +208,35 @@ def test_restore_removes_synced_at(tmp_path):
     assert (tmp_path / "remote-settings.json.synced-at").exists()
     policy.restore_remote_file(tmp_path)
     assert not (tmp_path / "remote-settings.json.synced-at").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="immutable flag via chflags (macOS)")
+def test_lock_makes_file_immutable_and_blocks_overwrite(tmp_path):
+    _org_remote(tmp_path)
+    remote = tmp_path / "remote-settings.json"
+    rec = policy.apply_remote_file(tmp_path, "set", {"env": {"DISABLE_TELEMETRY": "1"}}, lock=True)
+    try:
+        assert rec["locked"] is True
+        assert policy.is_immutable(remote)
+        # A plain overwrite (what Claude Code's re-sync does) must now fail.
+        with pytest.raises(OSError):
+            remote.write_text("clobber")
+        # Re-applying unlocks, rewrites, re-locks (idempotent).
+        rec2 = policy.apply_remote_file(tmp_path, "set", {"env": {"X": "1"}}, lock=True)
+        assert rec2["locked"] is True
+        assert json.loads(remote.read_text())["env"] == {"X": "1"}
+    finally:
+        policy._set_immutable(remote, False)  # cleanup so tmp_path can be removed
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="immutable flag via chflags (macOS)")
+def test_restore_unlocks(tmp_path):
+    _org_remote(tmp_path)
+    remote = tmp_path / "remote-settings.json"
+    policy.apply_remote_file(tmp_path, "reject", None, lock=True)
+    assert policy.is_immutable(remote)
+    policy.restore_remote_file(tmp_path)   # must clear the lock to restore
+    assert not policy.is_immutable(remote)
 
 
 def test_apply_remote_file_set_replaces_deny(tmp_path):

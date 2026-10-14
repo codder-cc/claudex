@@ -1002,7 +1002,9 @@ def policy_show(name: Optional[str]) -> None:
         console.print(f"  settings keys: {', '.join(keys) if keys else '(empty object)'}")
 
     # Live state of the on-disk managed file (what Claude Code actually reads).
-    from claudex.core.policy import read_remote_file, _deny_count, REMOTE_SETTINGS_BACKUP
+    from claudex.core.policy import (read_remote_file, _deny_count,
+                                      REMOTE_SETTINGS_BACKUP, is_immutable,
+                                      remote_settings_path)
     cfg = _pm().get(name).config_dir
     live = read_remote_file(cfg)
     rpath = cfg / "remote-settings.json"
@@ -1011,7 +1013,10 @@ def policy_show(name: Optional[str]) -> None:
     else:
         dc = _deny_count(live)
         deny_s = (f"[red]{dc} deny rule(s)[/red]" if dc else "[green]no deny rules[/green]")
-        console.print(f"  on-disk remote-settings.json: keys={sorted(live.keys()) or '∅'}, {deny_s}")
+        locked = " [yellow]🔒 immutable[/yellow]" if is_immutable(remote_settings_path(cfg)) else ""
+        console.print(f"  on-disk remote-settings.json: keys={sorted(live.keys()) or '∅'}, {deny_s}{locked}")
+    if pol.get("lock"):
+        console.print("  [dim]lock requested — file made immutable at each launch[/dim]")
     if (cfg / REMOTE_SETTINGS_BACKUP).exists():
         console.print(f"  [dim]org backup kept → `claudex policy off {name}` restores it[/dim]")
 
@@ -1085,17 +1090,21 @@ def policy_templates() -> None:
 @click.argument("name", required=False, default=None)
 @click.option("--template", "-t", "template_name", default="default", show_default=True,
               help="Which template to apply (see `claudex policy templates`).")
-def policy_default(name: Optional[str], template_name: str) -> None:
+@click.option("--lock/--no-lock", "-L", default=False,
+              help="Make remote-settings.json immutable so a background re-sync "
+                   "can't restore the org policy (macOS/Linux).")
+def policy_default(name: Optional[str], template_name: str, lock: bool) -> None:
     """Replace remote with a ready-made template (default: permissive, no telemetry)."""
     from claudex.core.policy import apply_template
     name = _resolve_policy_profile(name)
     try:
-        apply_template(name, template_name)
+        apply_template(name, template_name, lock=lock)
     except (KeyError, ValueError, OSError) as e:
         console.print(f"[red]Error:[/red] template '{template_name}' not usable: {e}")
         sys.exit(1)
+    lk = " [dim](locked)[/dim]" if lock else ""
     console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will apply the "
-                  f"[cyan]{template_name}[/cyan] template instead of the remote policy.")
+                  f"[cyan]{template_name}[/cyan] template instead of the remote policy.{lk}")
 
 
 @policy_group.command("reject")
@@ -1128,8 +1137,11 @@ def policy_freeze(name: Optional[str]) -> None:
 @click.option("--template", "-t", "template_name", default=None,
               help="Use a named template instead of a file "
                    "(see `claudex policy templates`).")
+@click.option("--lock/--no-lock", "-L", default=False,
+              help="Make remote-settings.json immutable so a background re-sync "
+                   "can't restore the org policy (macOS/Linux).")
 def policy_set(name: Optional[str], settings_file: Optional[str],
-               template_name: Optional[str]) -> None:
+               template_name: Optional[str], lock: bool) -> None:
     """Serve your own managed settings for a profile (serve 200)."""
     from claudex.core.policy import set_policy, apply_template
     name = _resolve_policy_profile(name)
@@ -1139,7 +1151,7 @@ def policy_set(name: Optional[str], settings_file: Optional[str],
 
     if template_name:
         try:
-            pol = apply_template(name, template_name)
+            pol = apply_template(name, template_name, lock=lock)
         except (KeyError, ValueError, OSError) as e:
             console.print(f"[red]Error:[/red] template '{template_name}' not usable: {e}")
             sys.exit(1)
@@ -1156,7 +1168,7 @@ def policy_set(name: Optional[str], settings_file: Optional[str],
     if not isinstance(settings, dict):
         console.print("[red]Error:[/red] settings file must contain a JSON object.")
         sys.exit(1)
-    set_policy(name, "set", settings)
+    set_policy(name, "set", settings, lock=lock)
     keys = sorted(settings.keys())
     console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] will apply your managed "
                   f"settings ({len(keys)} key(s): {', '.join(keys) or '∅'}).")
