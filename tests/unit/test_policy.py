@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -147,6 +148,25 @@ def test_augment_env_installs_shim_for_reject(tmp_path):
     assert env["CLAUDEX_POLICY_FILE"] == str(tmp_path / "work.json")
     assert env["CLAUDEX_POLICY_LOG"] == str(tmp_path / "logs" / "work.log")
     assert (tmp_path / "shim" / policy.SHIM_NAME).exists()
+
+
+def test_augment_env_sets_override_path_and_skips_fetch(tmp_path):
+    policy.set_policy("work", "set", {"env": {"DISABLE_TELEMETRY": "1"}}, policy_dir=tmp_path)
+    env: dict = {}
+    policy.augment_env(env, "work", config_dir=tmp_path / "cfg", policy_dir=tmp_path,
+                       shim_dir=tmp_path / "shim", logs_dir=tmp_path / "logs")
+    ov = env.get(policy.CC_REMOTE_SETTINGS_PATH_ENV)
+    assert ov and Path(ov).exists()
+    assert json.loads(Path(ov).read_text())["env"] == {"DISABLE_TELEMETRY": "1"}
+
+
+def test_override_file_reject_is_empty(tmp_path):
+    p = policy.write_override_file("work", "reject", None, policy_dir=tmp_path)
+    assert json.loads(Path(p).read_text()) == {}
+
+
+def test_override_file_freeze_skipped(tmp_path):
+    assert policy.write_override_file("work", "freeze", None, policy_dir=tmp_path) is None
 
 
 def test_augment_env_logs_launch_and_injects_privacy_env(tmp_path):

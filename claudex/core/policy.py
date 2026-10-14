@@ -49,6 +49,14 @@ LOGS_DIR = POLICY_DIR / "logs"                # per-profile activity logs (*.log
 #: considers the account eligible for remote managed settings.
 PRIVACY_ENV_VARS = ("DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
 
+#: Claude Code env var that points it at a local override file for remote managed
+#: settings and SKIPS the API fetch entirely ("Using override file …, skipping
+#: API fetch"). This is the decisive lever on Bun builds where the fetch bypasses
+#: our Node shim and re-syncs over the on-disk cache: no fetch → nothing to apply
+#: from the server, no consent prompt, no clobber. claudex writes the override
+#: settings to its own file and points this var at it.
+CC_REMOTE_SETTINGS_PATH_ENV = "CLAUDE_CODE_REMOTE_SETTINGS_PATH"
+
 #: Built-in policy templates — ready-made managed-settings payloads you can drop
 #: in with `claudex policy default` / `--template` instead of hand-writing JSON.
 #:
@@ -405,6 +413,35 @@ def _require_flag(shim: Path) -> str:
     return f'--require "{shim}"'
 
 
+def override_file_path(profile: str, policy_dir: Path = POLICY_DIR) -> Path:
+    """Path of the claudex-owned override file pointed at by
+    CLAUDE_CODE_REMOTE_SETTINGS_PATH (separate from the profile's own cache)."""
+    return policy_dir / f"{profile}.remote.json"
+
+
+def write_override_file(profile: str, mode: str, settings: Optional[dict],
+                        policy_dir: Path = POLICY_DIR) -> Optional[str]:
+    """Write the override settings file for CLAUDE_CODE_REMOTE_SETTINGS_PATH.
+
+    ``set`` → the served settings, ``reject`` → ``{}``. Returns the path, or
+    None for ``freeze`` (nothing written — let Claude Code use its own cache).
+    """
+    if mode == "freeze":
+        return None
+    payload = (settings or {}) if mode == "set" else {}
+    try:
+        policy_dir.mkdir(parents=True, exist_ok=True)
+        p = override_file_path(profile, policy_dir)
+        p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        try:
+            p.chmod(0o600)
+        except OSError:
+            pass
+        return str(p)
+    except OSError:
+        return None
+
+
 def log_path(profile: str, logs_dir: Path = LOGS_DIR) -> Path:
     return logs_dir / f"{profile}.log"
 
@@ -483,8 +520,15 @@ def augment_env(
     if os.environ.get("CLAUDEX_POLICY_DEBUG") == "1":
         env["CLAUDEX_POLICY_DEBUG"] = "1"
 
-    # Primary override for the cached-file delivery model: rewrite the on-disk
-    # remote-settings.json so the managed layer read at launch is ours.
+    # PRIMARY lever: point Claude Code at our own override file and skip the API
+    # fetch entirely. This is the only thing that holds on Bun builds where the
+    # fetch bypasses the Node shim and re-applies the org policy in memory.
+    override = write_override_file(profile, mode, pol.get("settings"), policy_dir)
+    if override:
+        env[CC_REMOTE_SETTINGS_PATH_ENV] = override
+
+    # Secondary (belt-and-suspenders): also rewrite the on-disk remote-settings.json
+    # for builds that read the cached file directly.
     file_action = None
     if config_dir is not None:
         file_action = apply_remote_file(Path(config_dir), mode, pol.get("settings"),
@@ -505,6 +549,7 @@ def augment_env(
         "mode": mode,
         "label": pol.get("label"),
         "shim": str(shim),
+        "override_file": override,
         "remote_file": file_action,
         "injected_env": injected,
     }, logs_dir)

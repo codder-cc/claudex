@@ -1058,6 +1058,9 @@ def policy_log(name: Optional[str], lines: int, clear: bool) -> None:
             console.print(f"  [dim]{ts}[/dim] [cyan]launch[/cyan] "
                           f"mode={r.get('mode')} label={r.get('label') or '-'} "
                           f"privacy_env=[{inj_s}]")
+            if r.get("override_file"):
+                console.print("           [dim]↳ CLAUDE_CODE_REMOTE_SETTINGS_PATH set "
+                              "→ API fetch skipped[/dim]")
             console.print(f"           [dim]↳ {rf_s}[/dim]")
         elif ev == "settings_intercept":
             keys = ", ".join(r.get("served_keys") or []) or "∅"
