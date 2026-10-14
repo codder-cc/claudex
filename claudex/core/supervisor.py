@@ -326,8 +326,6 @@ class Supervisor:
         self._hooked_dirs: set[Path] = set()
         self._child: Optional[subprocess.Popen] = None
         self._shutdown = False
-        self._proxy_server = None          # local api.anthropic.com proxy (lazy)
-        self._proxy_base: Optional[str] = None
         # None → honor each profile's stored flag; True/False → force for this run.
         self._proxy_override = proxy_override
 
@@ -432,26 +430,16 @@ class Supervisor:
 
     # -- process control -------------------------------------------------
     def _proxy_base_for(self, profile: str) -> Optional[str]:
-        """Return the local-proxy base URL for *profile*, starting the proxy once
-        (shared across relaunches/switches) if proxy mode is enabled."""
+        """Return the shared proxy daemon's base URL for *profile* (auto-started),
+        or None if proxy mode is not in effect for it."""
         from claudex.core.policy import proxy_enabled
         want = self._proxy_override
         if want is None:
             want = proxy_enabled(profile)
         if not want:
             return None
-        if self._proxy_server is None:
-            from claudex.core.proxy import start_background
-            self._proxy_server, _thread, self._proxy_base = start_background()
-        return self._proxy_base
-
-    def _stop_proxy(self) -> None:
-        if self._proxy_server is not None:
-            try:
-                self._proxy_server.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            self._proxy_server = None
+        from claudex.core.proxy import ensure_shared
+        return ensure_shared()
 
     def _env_for(self, config_dir: str, profile: str) -> dict:
         env = {**os.environ,
@@ -463,12 +451,13 @@ class Supervisor:
         # remote-settings.json cache.
         from claudex.core.policy import augment_env
         augment_env(env, profile, config_dir=Path(config_dir))
-        # Proxy mode: point ANTHROPIC_BASE_URL at the local forwarder so the org
-        # managed policy is skipped (fail-open orgs); inference still reaches the
-        # real API through the proxy.
+        # Proxy mode: route through the shared proxy daemon so the org managed
+        # policy is skipped (fail-open orgs) and telemetry is off; inference
+        # still reaches the real API through the proxy.
         base = self._proxy_base_for(profile)
         if base:
-            env["ANTHROPIC_BASE_URL"] = base
+            from claudex.core.proxy import proxy_env
+            env.update(proxy_env(base))
         return env
 
     def _run_child_until_switch_or_exit(
@@ -572,7 +561,6 @@ class Supervisor:
         finally:
             self._clear_liveness()
             self._restore_hooks()
-            self._stop_proxy()
 
     def run_dry(self, timeout: Optional[float] = None) -> Optional[PlannedLaunch]:
         """Dry-run: register liveness, wait for one switch request, print the

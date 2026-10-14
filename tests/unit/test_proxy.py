@@ -4,12 +4,50 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 
 import pytest
 
 from claudex.core import proxy
+
+
+def test_proxy_env_routes_and_disables_telemetry():
+    e = proxy.proxy_env("http://127.0.0.1:1234")
+    assert e["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
+    assert e["DISABLE_TELEMETRY"] == "1"
+
+
+def test_status_running_for_live_liveness(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxy, "PROXY_FILE", tmp_path / ".proxy")
+    srv = proxy.make_server(port=0)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = srv.server_address[0], srv.server_address[1]
+        (tmp_path / ".proxy").write_text(json.dumps(
+            {"pid": os.getpid(), "host": host, "port": port, "url": f"http://{host}:{port}"}))
+        st = proxy.status()
+        assert st["running"] is True
+        assert st["url"].endswith(str(port))
+    finally:
+        srv.shutdown()
+
+
+def test_status_not_running_for_dead_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxy, "PROXY_FILE", tmp_path / ".proxy")
+    (tmp_path / ".proxy").write_text(json.dumps(
+        {"pid": 999999, "host": "127.0.0.1", "port": 59998, "url": "http://127.0.0.1:59998"}))
+    assert proxy.status()["running"] is False
+
+
+def test_stop_shared_cleans_file_for_dead_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxy, "PROXY_FILE", tmp_path / ".proxy")
+    (tmp_path / ".proxy").write_text(json.dumps(
+        {"pid": 999999, "host": "127.0.0.1", "port": 1, "url": "http://x"}))
+    assert proxy.stop_shared() is False     # dead pid → nothing killed
+    assert not (tmp_path / ".proxy").exists()  # but stale file removed
 
 
 def test_make_server_binds_free_port_and_base_url():

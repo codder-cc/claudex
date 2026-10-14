@@ -294,19 +294,17 @@ def use_profile(name: str, claude_args: tuple) -> None:
         cmd = [CLAUDE_BIN] + list(claude_args)
 
         if proxy_enabled(name):
-            # Host the local api.anthropic.com proxy for this session so Claude
-            # Code sees a non-Anthropic base URL and skips the org policy. Run
-            # claude as a child (not exec) so we can stop the proxy afterwards.
-            from claudex.core.proxy import start_background
-            server, _thread, base = start_background()
-            env["ANTHROPIC_BASE_URL"] = base
-            console.print(f"[dim]proxy on → ANTHROPIC_BASE_URL={base} "
-                          f"(org managed policy skipped)[/dim]")
-            try:
-                result = subprocess.run(cmd, env=env)
-            finally:
-                server.shutdown()
-            sys.exit(result.returncode)
+            # Route through the shared proxy daemon (auto-started, reused across
+            # every launch) so Claude Code sees a non-Anthropic base URL and
+            # skips the org policy; telemetry off by default.
+            from claudex.core.proxy import ensure_shared, proxy_env
+            base = ensure_shared()
+            if base:
+                env.update(proxy_env(base))
+                console.print(f"[dim]proxy on → {base} (org policy skipped, telemetry off)[/dim]")
+            else:
+                console.print("[yellow]warning:[/yellow] proxy mode requested but the "
+                              "shared proxy could not start; launching without it.")
 
         if sys.platform != "win32":
             os.execvpe(cmd[0], cmd, env)  # replace this process (Unix)
@@ -1235,38 +1233,64 @@ def policy_off(name: Optional[str]) -> None:
 
 
 @cli.command("proxy")
+@click.option("--start", "action", flag_value="start", help="Start the shared proxy daemon.")
+@click.option("--stop", "action", flag_value="stop", help="Stop the shared proxy daemon.")
+@click.option("--status", "action", flag_value="status", help="Show the shared proxy status.")
+@click.option("--daemon", "action", flag_value="daemon", hidden=True,
+              help="(internal) run the daemon body in the foreground.")
 @click.option("--port", "-p", default=0, show_default="auto (free port)",
               help="Local port to listen on (0 = pick a free one).")
 @click.option("--host", default="127.0.0.1", show_default=True, help="Local bind address.")
-def proxy_cmd(port: int, host: str) -> None:
-    """Run a local reverse proxy to api.anthropic.com.
+def proxy_cmd(action: Optional[str], port: int, host: str) -> None:
+    """Manage the local reverse proxy to api.anthropic.com.
 
-    Point a profile at it so Claude Code sees a non-Anthropic base URL and skips
-    the org managed-settings pull, while inference still reaches the real API:
+    A single shared daemon serves every proxy-mode launch (use/run/fleet), so
+    even 100 concurrent `claude -p` share one forwarder. It auto-starts on first
+    use; these flags let you manage it explicitly.
 
     \b
-      # terminal 1
-      claudex proxy
-      # terminal 2 (use the printed URL)
-      CLAUDE_CONFIG_DIR=~/.claudex/profiles/<name> \\
-        ANTHROPIC_BASE_URL=http://127.0.0.1:<port> claude
+      claudex proxy --start     # start the shared daemon (prints its URL)
+      claudex proxy --status    # is it running? on what URL?
+      claudex proxy --stop      # stop it
 
-    Usually you don't run this by hand — `claudex policy proxy <name>` then
-    `claudex run <name>` (or `run --proxy`) does it automatically. Only works
-    where the org policy is fail-open (an org that *requires* managed settings
-    blocks startup when the gateway is unreachable — not overridable locally).
+    With no flag, runs a one-off proxy in the foreground (Ctrl+C to stop). Only
+    works where the org policy is fail-open.
     """
-    from claudex.core.proxy import make_server, base_url_for
+    from claudex.core import proxy as pxy
+
+    if action == "daemon":
+        pxy.run_daemon(host, port)
+        return
+    if action == "status":
+        st = pxy.status()
+        if st["running"]:
+            console.print(f"[green]running[/green] → [bold]{st['url']}[/bold] (pid {st['pid']})")
+        else:
+            console.print("[yellow]not running[/yellow]")
+        return
+    if action == "stop":
+        stopped = pxy.stop_shared()
+        console.print("[green]✓[/green] stopped." if stopped else "[dim]nothing to stop.[/dim]")
+        return
+    if action == "start":
+        url = pxy.ensure_shared(host)
+        if url:
+            console.print(f"[green]✓[/green] shared proxy at [bold]{url}[/bold] "
+                          f"→ api.anthropic.com")
+        else:
+            console.print("[red]Error:[/red] could not start the shared proxy daemon.")
+            sys.exit(1)
+        return
+
+    # No flag: one-off foreground proxy.
     try:
-        server = make_server(host, port)
+        server = pxy.make_server(host, port)
     except OSError as e:
         console.print(f"[red]Error:[/red] could not bind {host}:{port}: {e}")
         sys.exit(1)
-    base = base_url_for(server)
+    base = pxy.base_url_for(server)
     console.print(f"[cyan]claudex proxy[/cyan] → forwarding [bold]{base}[/bold] "
-                  f"to [bold]api.anthropic.com[/bold]")
-    console.print(f"  Set [cyan]ANTHROPIC_BASE_URL={base}[/cyan] for the profile.")
-    console.print("  [dim]Ctrl+C to stop.[/dim]")
+                  f"to [bold]api.anthropic.com[/bold]  [dim](Ctrl+C to stop)[/dim]")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

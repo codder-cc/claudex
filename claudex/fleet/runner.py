@@ -84,6 +84,16 @@ def build_claude_env(auth: AuthManager, profile_name: str, config_dir: Path) -> 
     """
     env = {k: v for k, v in os.environ.items() if k != CLAUDE_CONFIG_DIR_ENV}
     env.update(auth.get_env_for_profile(profile_name, config_dir))
+    # Apply the profile's remote-settings policy + proxy mode to batch workers
+    # too, so `claudex fleet` jobs get the same local overrides as interactive
+    # launches (and share the one proxy daemon).
+    from claudex.core.policy import augment_env, proxy_enabled
+    augment_env(env, profile_name, config_dir=config_dir)
+    if proxy_enabled(profile_name):
+        from claudex.core.proxy import ensure_shared, proxy_env
+        base = ensure_shared()
+        if base:
+            env.update(proxy_env(base))
     return env
 
 

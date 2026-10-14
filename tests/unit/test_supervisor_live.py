@@ -169,27 +169,23 @@ def test_live_loop_natural_exit_no_switch(env, tmp_path):
     assert not (tmp_path / ".supervisor").exists()
 
 
-def test_proxy_override_controls_base_url(env):
-    """proxy_override forces the local proxy on/off regardless of the stored flag."""
+def test_proxy_override_controls_base_url(env, monkeypatch):
+    """proxy_override forces proxy mode on/off regardless of the stored flag."""
     from claudex.core.supervisor import Supervisor
-    from claudex.core import policy
     tmp_path, pm = env
     pm.create("incr")
 
-    # override=True → proxy starts, ANTHROPIC_BASE_URL points at it
-    sup = Supervisor("incr", pm=pm, proxy_override=True, install_hook=False)
-    try:
-        base = sup._proxy_base_for("incr")
-        assert base and base.startswith("http://127.0.0.1:")
-        env2 = sup._env_for(str(pm.get("incr").config_dir), "incr")
-        assert env2["ANTHROPIC_BASE_URL"] == base
-    finally:
-        sup._stop_proxy()
+    # Stub the shared daemon so the test never spawns a real proxy process.
+    monkeypatch.setattr("claudex.core.proxy.ensure_shared",
+                        lambda *a, **k: "http://127.0.0.1:59999")
 
-    # override=False → no proxy even if the profile flag is on
-    policy.set_proxy("incr", True, policy_dir=tmp_path / "policy")
+    # override=True → env routed through the (stubbed) proxy + telemetry off
+    sup = Supervisor("incr", pm=pm, proxy_override=True, install_hook=False)
+    env2 = sup._env_for(str(pm.get("incr").config_dir), "incr")
+    assert env2["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:59999"
+    assert env2["DISABLE_TELEMETRY"] == "1"
+
+    # override=False → no proxy env at all
     sup2 = Supervisor("incr", pm=pm, proxy_override=False, install_hook=False)
-    try:
-        assert sup2._proxy_base_for("incr") is None
-    finally:
-        sup2._stop_proxy()
+    env3 = sup2._env_for(str(pm.get("incr").config_dir), "incr")
+    assert "ANTHROPIC_BASE_URL" not in env3
