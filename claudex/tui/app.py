@@ -109,6 +109,8 @@ def run_app() -> None:
     if action == "launch":
         _, profile_name, config_dir = result
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env
         augment_env(env, profile_name, config_dir=Path(config_dir))
         try:
@@ -119,6 +121,8 @@ def run_app() -> None:
     elif action == "resume":
         _, profile_name, config_dir, session_id = result
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env
         augment_env(env, profile_name, config_dir=Path(config_dir))
         cmd = [CLAUDE_BIN, "--resume", session_id] if session_id else [CLAUDE_BIN]
@@ -130,6 +134,8 @@ def run_app() -> None:
     elif action == "auth_login":
         _, profile_name, config_dir = result
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env
         augment_env(env, profile_name, config_dir=Path(config_dir))
         try:

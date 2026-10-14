@@ -29,6 +29,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "resume_strategy": "env", # env | direct (--resume flag)
     "tui_refresh_seconds": 5,
     "sharing_endpoint": "",   # URL of a claudex-sharing server (e.g. https://codder.cc)
+    "disable_autoupdate": True,  # inject DISABLE_AUTOUPDATER=1 into every claude launch
 }
 
 
@@ -95,6 +96,27 @@ class GlobalConfig:
     def sharing_endpoint(self, url: str) -> None:
         self.set("sharing_endpoint", url.rstrip("/"))
 
+    @property
+    def disable_autoupdate(self) -> bool:
+        return bool(self.get("disable_autoupdate", True))
+
+    @disable_autoupdate.setter
+    def disable_autoupdate(self, value: bool) -> None:
+        self.set("disable_autoupdate", bool(value))
+
 
 def load_config() -> GlobalConfig:
     return GlobalConfig().load()
+
+
+def global_launch_env() -> dict[str, str]:
+    """Env additions claudex applies to EVERY claude launch (global defaults).
+
+    Currently: disables Claude Code's auto-updater by default so the installed
+    version stays pinned (predictable for the proxy, and for reverse work). Opt
+    back in with ``claudex config set autoupdate on``.
+    """
+    env: dict[str, str] = {}
+    if load_config().disable_autoupdate:
+        env["DISABLE_AUTOUPDATER"] = "1"
+    return env

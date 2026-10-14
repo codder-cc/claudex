@@ -63,6 +63,7 @@ Usage:
   -- Config --
   claudex config set sharing.endpoint <url>     Set default sharing endpoint
   claudex config get sharing.endpoint           Show current sharing endpoint
+  claudex config set autoupdate off|on          Pin claude's version (default: off)
 
   -- Other --
   claudex doctor                        Diagnose installation issues
@@ -289,6 +290,8 @@ def use_profile(name: str, claude_args: tuple) -> None:
         am = _auth()
         profile = pm.get(name)
         env = {**os.environ, **am.get_env_for_profile(name, profile.config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env, proxy_enabled
         augment_env(env, name, config_dir=profile.config_dir)
         cmd = [CLAUDE_BIN] + list(claude_args)
@@ -1316,6 +1319,12 @@ def config_set(key: str, value: str) -> None:
         cfg.sharing_endpoint = value
         cfg.save()
         console.print(f"[green]✓[/green] sharing.endpoint = {value}")
+    elif key == "autoupdate":
+        on = value.strip().lower() in ("on", "true", "1", "yes", "enabled")
+        cfg.disable_autoupdate = not on
+        cfg.save()
+        state = "ON (claude will auto-update)" if on else "OFF (DISABLE_AUTOUPDATER=1 on every launch)"
+        console.print(f"[green]✓[/green] autoupdate = {state}")
     else:
         console.print(f"[red]Unknown config key:[/red] {key}")
         sys.exit(1)
@@ -1329,6 +1338,8 @@ def config_get(key: str) -> None:
     if key == "sharing.endpoint":
         val = cfg.sharing_endpoint or "(not set)"
         console.print(f"sharing.endpoint = {val}")
+    elif key == "autoupdate":
+        console.print(f"autoupdate = {'off' if cfg.disable_autoupdate else 'on'}")
     else:
         console.print(f"[red]Unknown config key:[/red] {key}")
         sys.exit(1)

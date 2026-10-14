@@ -69,6 +69,8 @@ class AuthManager:
         if not self._claude_available():
             raise ClaudeNotFoundError()
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         # Apply the profile's remote-settings policy to the login session too, so
         # the override is active from the very first fetch (before the org policy
         # can land un-overridden). No-op unless a policy is set.

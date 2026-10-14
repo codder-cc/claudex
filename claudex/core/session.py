@@ -61,6 +61,8 @@ class SessionManager:
             raise ClaudeNotFoundError()
 
         env = {**os.environ, **self._auth.get_env_for_profile(profile_name, config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env
         augment_env(env, profile_name, config_dir=config_dir)
 
@@ -83,6 +85,8 @@ class SessionManager:
         if not self._claude_available():
             raise ClaudeNotFoundError()
         env = {**os.environ, **self._auth.get_env_for_profile(profile_name, config_dir)}
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env
         augment_env(env, profile_name, config_dir=config_dir)
         cmd = [CLAUDE_BIN] + (extra_args or [])

@@ -84,6 +84,8 @@ def build_claude_env(auth: AuthManager, profile_name: str, config_dir: Path) -> 
     """
     env = {k: v for k, v in os.environ.items() if k != CLAUDE_CONFIG_DIR_ENV}
     env.update(auth.get_env_for_profile(profile_name, config_dir))
+    from claudex.core.config import global_launch_env
+    env.update(global_launch_env())
     # Apply the profile's remote-settings policy + proxy mode to batch workers
     # too, so `claudex fleet` jobs get the same local overrides as interactive
     # launches (and share the one proxy daemon).

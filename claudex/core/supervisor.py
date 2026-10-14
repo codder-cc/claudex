@@ -449,6 +449,8 @@ class Supervisor:
         # Apply the profile's remote-settings policy (no-op unless set). Touches
         # no credentials — only NODE_OPTIONS, the shim, and the profile's own
         # remote-settings.json cache.
+        from claudex.core.config import global_launch_env
+        env.update(global_launch_env())
         from claudex.core.policy import augment_env
         augment_env(env, profile, config_dir=Path(config_dir))
         # Proxy mode: route through the shared proxy daemon so the org managed
