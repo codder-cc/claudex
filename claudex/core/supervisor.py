@@ -432,9 +432,10 @@ class Supervisor:
                ENV_SUPERVISOR: "1",
                ENV_ACTIVE_PROFILE: profile}
         # Apply the profile's remote-settings policy (no-op unless set). Touches
-        # no credentials — only NODE_OPTIONS + a state-file pointer for the shim.
+        # no credentials — only NODE_OPTIONS, the shim, and the profile's own
+        # remote-settings.json cache.
         from claudex.core.policy import augment_env
-        augment_env(env, profile)
+        augment_env(env, profile, config_dir=Path(config_dir))
         return env
 
     def _run_child_until_switch_or_exit(

@@ -290,7 +290,7 @@ def use_profile(name: str, claude_args: tuple) -> None:
         profile = pm.get(name)
         env = {**os.environ, **am.get_env_for_profile(name, profile.config_dir)}
         from claudex.core.policy import augment_env
-        augment_env(env, name)
+        augment_env(env, name, config_dir=profile.config_dir)
         cmd = [CLAUDE_BIN] + list(claude_args)
         if sys.platform != "win32":
             os.execvpe(cmd[0], cmd, env)  # replace this process (Unix)
@@ -1143,11 +1143,13 @@ def policy_set(name: Optional[str], settings_file: Optional[str],
 @click.argument("name", required=False, default=None)
 def policy_off(name: Optional[str]) -> None:
     """Disable the local override; Claude Code uses the real backend again."""
-    from claudex.core.policy import set_policy
+    from claudex.core.policy import set_policy, restore_remote_file
     name = _resolve_policy_profile(name)
     set_policy(name, "off")
+    restored = restore_remote_file(_pm().get(name).config_dir)
+    note = " (restored the org-pushed remote-settings.json)" if restored else ""
     console.print(f"[green]✓[/green] Profile [bold]{name}[/bold] back to the real "
-                  f"backend for managed settings.")
+                  f"backend for managed settings.{note}")
 
 
 # ─── Config commands ──────────────────────────────────────────────────────────

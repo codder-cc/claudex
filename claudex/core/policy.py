@@ -229,6 +229,78 @@ def ensure_shim(shim_dir: Path = SHIM_DIR) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Direct control of the on-disk managed-settings cache
+# ---------------------------------------------------------------------------
+#
+# Newer Claude Code builds deliver the org policy as a synced file
+# (``remote-settings.json`` + a ``remote-settings.json.synced-at`` sidecar) and
+# read it straight from disk at launch *without* always re-fetching — so the
+# network shim never sees a request to intercept. The robust override for that
+# model is to rewrite the file itself: the applied managed layer IS this file.
+# The shim stays as a second line of defence for the builds/paths that do fetch.
+
+REMOTE_SETTINGS_NAME = "remote-settings.json"
+REMOTE_SETTINGS_BACKUP = "remote-settings.json.claudex-bak"
+
+
+def remote_settings_path(config_dir: Path) -> Path:
+    return config_dir / REMOTE_SETTINGS_NAME
+
+
+def apply_remote_file(config_dir: Path, mode: str, settings: Optional[dict]) -> Optional[str]:
+    """Rewrite ``config_dir/remote-settings.json`` to match the active policy.
+
+    Backs up the org-pushed file once (``*.claudex-bak``) before the first
+    overwrite. ``reject`` → ``{}`` (no managed policy), ``set`` → the served
+    settings, ``freeze`` → left untouched. Returns a short action string for the
+    activity log, or ``None`` if nothing was written.
+    """
+    remote = remote_settings_path(config_dir)
+    backup = config_dir / REMOTE_SETTINGS_BACKUP
+    if mode == "freeze":
+        return None
+    if mode == "reject":
+        payload: dict = {}
+    elif mode == "set":
+        payload = settings or {}
+    else:
+        return None
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        # Preserve the original org policy once, so `policy off` can restore it.
+        if remote.exists() and not backup.exists():
+            backup.write_bytes(remote.read_bytes())
+        remote.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        try:
+            remote.chmod(0o600)
+        except OSError:
+            pass
+        return f"wrote {REMOTE_SETTINGS_NAME} ({'empty' if not payload else ','.join(sorted(payload))})"
+    except OSError:
+        return None
+
+
+def restore_remote_file(config_dir: Path) -> bool:
+    """Restore the org-pushed ``remote-settings.json`` from the claudex backup.
+
+    Returns True if a backup was restored. If no backup exists, removes any
+    claudex-written file so the next server sync re-downloads the real policy.
+    """
+    remote = remote_settings_path(config_dir)
+    backup = config_dir / REMOTE_SETTINGS_BACKUP
+    try:
+        if backup.exists():
+            remote.write_bytes(backup.read_bytes())
+            backup.unlink()
+            return True
+        # No backup: drop our file so a fresh sync pulls the authoritative one.
+        remote.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Env injection (used by both launch paths)
 # ---------------------------------------------------------------------------
 
@@ -280,6 +352,7 @@ def clear_log(profile: str, logs_dir: Path = LOGS_DIR) -> None:
 def augment_env(
     env: dict,
     profile: str,
+    config_dir: Optional[Path] = None,
     policy_dir: Path = POLICY_DIR,
     shim_dir: Path = SHIM_DIR,
     logs_dir: Path = LOGS_DIR,
@@ -290,6 +363,9 @@ def augment_env(
       * installs the shim and appends ``--require <shim>`` to ``NODE_OPTIONS``
         (preserving anything already there);
       * points the shim at the profile's state file and a per-profile log file;
+      * when *config_dir* is given, rewrites its ``remote-settings.json`` to the
+        active policy (the reliable override for builds that read the cached file
+        without re-fetching);
       * for ``set`` policies, injects any PRIVACY_ENV_VARS from the served
         settings straight into the launch env (telemetry off regardless of
         remote-settings eligibility);
@@ -311,6 +387,12 @@ def augment_env(
     if os.environ.get("CLAUDEX_POLICY_DEBUG") == "1":
         env["CLAUDEX_POLICY_DEBUG"] = "1"
 
+    # Primary override for the cached-file delivery model: rewrite the on-disk
+    # remote-settings.json so the managed layer read at launch is ours.
+    file_action = None
+    if config_dir is not None:
+        file_action = apply_remote_file(Path(config_dir), mode, pol.get("settings"))
+
     # Belt-and-suspenders privacy: push telemetry kill-switches directly into the
     # launch env (not only via the served managed settings, which only apply when
     # eligible). Only a small, known-safe allowlist is forwarded.
@@ -326,6 +408,7 @@ def augment_env(
         "mode": mode,
         "label": pol.get("label"),
         "shim": str(shim),
+        "remote_file": file_action,
         "injected_env": injected,
     }, logs_dir)
     return env

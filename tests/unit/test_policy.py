@@ -172,6 +172,67 @@ def test_read_log_empty_and_clear(tmp_path):
     assert policy.read_log("work", logs_dir=tmp_path) == []
 
 
+# ---------------------------------------------------------------------------
+# Direct remote-settings.json control (the cached-file delivery model)
+# ---------------------------------------------------------------------------
+
+def _org_remote(config_dir):
+    """Simulate an org-pushed remote-settings.json with a deny list."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "remote-settings.json").write_text(
+        json.dumps({"permissions": {"deny": ["Edit(~/Documents/**)"]},
+                    "env": {"CLAUDE_CODE_ENABLE_TELEMETRY": "1"}}),
+        encoding="utf-8")
+
+
+def test_apply_remote_file_reject_empties_and_backs_up(tmp_path):
+    _org_remote(tmp_path)
+    policy.apply_remote_file(tmp_path, "reject", None)
+    assert json.loads((tmp_path / "remote-settings.json").read_text()) == {}
+    # Original preserved for restore.
+    assert (tmp_path / "remote-settings.json.claudex-bak").exists()
+
+
+def test_apply_remote_file_set_replaces_deny(tmp_path):
+    _org_remote(tmp_path)
+    policy.apply_remote_file(tmp_path, "set", {"env": {"DISABLE_TELEMETRY": "1"}})
+    data = json.loads((tmp_path / "remote-settings.json").read_text())
+    assert "permissions" not in data          # deny gone
+    assert data["env"] == {"DISABLE_TELEMETRY": "1"}
+
+
+def test_apply_remote_file_freeze_leaves_untouched(tmp_path):
+    _org_remote(tmp_path)
+    before = (tmp_path / "remote-settings.json").read_text()
+    assert policy.apply_remote_file(tmp_path, "freeze", None) is None
+    assert (tmp_path / "remote-settings.json").read_text() == before
+
+
+def test_restore_remote_file_recovers_org_policy(tmp_path):
+    _org_remote(tmp_path)
+    policy.apply_remote_file(tmp_path, "reject", None)
+    assert policy.restore_remote_file(tmp_path) is True
+    data = json.loads((tmp_path / "remote-settings.json").read_text())
+    assert data["permissions"]["deny"] == ["Edit(~/Documents/**)"]
+    assert not (tmp_path / "remote-settings.json.claudex-bak").exists()
+
+
+def test_augment_env_rewrites_remote_file_and_logs(tmp_path):
+    cfg = tmp_path / "cfg"
+    _org_remote(cfg)
+    policy.set_policy("work", "set", {"env": {"DISABLE_TELEMETRY": "1"}},
+                      policy_dir=tmp_path, label="template:default")
+    env: dict = {}
+    policy.augment_env(env, "work", config_dir=cfg, policy_dir=tmp_path,
+                       shim_dir=tmp_path / "shim", logs_dir=tmp_path / "logs")
+    # remote file rewritten → no deny
+    data = json.loads((cfg / "remote-settings.json").read_text())
+    assert "permissions" not in data and data["env"]["DISABLE_TELEMETRY"] == "1"
+    # logged the file action
+    rec = policy.read_log("work", logs_dir=tmp_path / "logs")[-1]
+    assert rec["remote_file"] and "remote-settings.json" in rec["remote_file"]
+
+
 def test_augment_env_preserves_existing_node_options(tmp_path):
     policy.set_policy("work", "reject", policy_dir=tmp_path)
     env = {"NODE_OPTIONS": "--max-old-space-size=4096"}
