@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -108,6 +109,8 @@ def run_app() -> None:
     if action == "launch":
         _, profile_name, config_dir = result
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.policy import augment_env
+        augment_env(env, profile_name, config_dir=Path(config_dir))
         try:
             subprocess.run([CLAUDE_BIN], env=env)
         except FileNotFoundError:
@@ -116,6 +119,8 @@ def run_app() -> None:
     elif action == "resume":
         _, profile_name, config_dir, session_id = result
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.policy import augment_env
+        augment_env(env, profile_name, config_dir=Path(config_dir))
         cmd = [CLAUDE_BIN, "--resume", session_id] if session_id else [CLAUDE_BIN]
         try:
             subprocess.run(cmd, env=env)
@@ -125,6 +130,8 @@ def run_app() -> None:
     elif action == "auth_login":
         _, profile_name, config_dir = result
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        from claudex.core.policy import augment_env
+        augment_env(env, profile_name, config_dir=Path(config_dir))
         try:
             subprocess.run([CLAUDE_BIN, "/login"], env=env)
             from claudex.core.auth import AuthManager

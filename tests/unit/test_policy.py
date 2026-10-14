@@ -251,6 +251,40 @@ def test_augment_env_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Launch wiring: auth add applies the policy to the login session
+# ---------------------------------------------------------------------------
+
+def test_auth_add_applies_policy_to_login(monkeypatch, tmp_path):
+    from claudex.core import auth as authmod
+    seen = {}
+
+    def fake_augment(env, profile, config_dir=None, **kw):
+        seen["profile"] = profile
+        seen["config_dir"] = config_dir
+        env["NODE_OPTIONS"] = "sentinel-shim"
+        return env
+
+    monkeypatch.setattr("claudex.core.policy.augment_env", fake_augment)
+
+    captured = {}
+
+    class _R:
+        returncode = 0
+
+    monkeypatch.setattr(authmod.subprocess, "run",
+                        lambda cmd, env=None, **kw: captured.update(env=env) or _R())
+
+    am = authmod.AuthManager()
+    monkeypatch.setattr(am, "_claude_available", lambda: True)
+    monkeypatch.setattr(am, "_import_claude_credentials", lambda *a, **k: None)
+
+    am.add_account_oauth("workm", tmp_path)
+
+    assert seen["profile"] == "workm" and seen["config_dir"] == tmp_path
+    assert captured["env"]["NODE_OPTIONS"] == "sentinel-shim"  # policy reached /login
+
+
+# ---------------------------------------------------------------------------
 # Node smoke test: the shim actually intercepts the endpoint.
 # Skipped where node is unavailable.
 # ---------------------------------------------------------------------------

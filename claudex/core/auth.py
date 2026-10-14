@@ -69,6 +69,11 @@ class AuthManager:
         if not self._claude_available():
             raise ClaudeNotFoundError()
         env = {**os.environ, CLAUDE_CONFIG_DIR_ENV: str(config_dir)}
+        # Apply the profile's remote-settings policy to the login session too, so
+        # the override is active from the very first fetch (before the org policy
+        # can land un-overridden). No-op unless a policy is set.
+        from claudex.core.policy import augment_env
+        augment_env(env, profile_name, config_dir=config_dir)
         try:
             subprocess.run([CLAUDE_BIN, "/login"], env=env, check=False)
         except FileNotFoundError:
