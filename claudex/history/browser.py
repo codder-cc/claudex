@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Iterator, Optional
 
+from claudex.core.switch import rewrite_transcript
 from claudex.history.models import Session
 from claudex.history.parser import iter_sessions
 
@@ -78,21 +79,39 @@ class HistoryBrowser:
         sessions = self.get_sessions_for_profile(profile_name, limit=1)
         return sessions[0] if sessions else None
 
-    def migrate_session(self, session: Session, to_profile_name: str, to_config_dir: Path) -> Session:
-        """Copy a session JSONL file from one profile to another."""
+    def migrate_session(
+        self,
+        session: Session,
+        to_profile_name: str,
+        to_config_dir: Path,
+        strip: bool = True,
+    ) -> Session:
+        """Copy a session from one profile to another, the way a switch carries it.
+
+        The transcript goes through :func:`rewrite_transcript`, so signature
+        blocks (thinking / redacted_thinking / connector_text) are stripped by
+        default — they are bound to the issuing account and a different account
+        rejects them with a 400 on the first request. The session's sibling
+        directory (subagent transcripts, persisted tool results) comes along,
+        its transcripts stripped the same way. ``strip=False`` copies verbatim,
+        which is only safe between profiles of the same account.
+        """
         if session.profile_name == to_profile_name:
             raise ValueError("Source and destination profiles are the same.")
-        dest_projects = to_config_dir / "projects" / session.file_path.parent.name
-        dest_projects.mkdir(parents=True, exist_ok=True)
-        dest_file = dest_projects / session.file_path.name
-        if dest_file.resolve() == session.file_path.resolve():
+        src_file = session.file_path
+        dest_projects = to_config_dir / "projects" / src_file.parent.name
+        dest_file = dest_projects / src_file.name
+        if dest_file.resolve() == src_file.resolve():
             raise ValueError("Source and destination paths are identical.")
         if dest_file.exists():
             raise FileExistsError(
                 f"A session '{session.session_id}' already exists in profile "
                 f"'{to_profile_name}'."
             )
-        shutil.copy2(str(session.file_path), str(dest_file))
+        rewrite_transcript(src_file, dest_file, strip=strip)
+        src_dir = src_file.with_suffix("")
+        if src_dir.is_dir():
+            _carry_session_dir(src_dir, dest_file.with_suffix(""), strip)
         from claudex.history.parser import parse_session_file
         new_session = parse_session_file(dest_file, to_profile_name)
         if new_session is None:
@@ -102,3 +121,16 @@ class HistoryBrowser:
     def delete_session(self, session: Session) -> None:
         """Delete a session JSONL file."""
         session.file_path.unlink(missing_ok=True)
+
+
+def _carry_session_dir(src: Path, dst: Path, strip: bool) -> None:
+    """Copy a session's sibling directory, rewriting every transcript in it."""
+    for path in src.rglob("*"):
+        if not path.is_file():
+            continue
+        target = dst / path.relative_to(src)
+        if path.suffix == ".jsonl":
+            rewrite_transcript(path, target, strip=strip)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)

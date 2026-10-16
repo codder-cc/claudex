@@ -92,8 +92,10 @@ class SessionManager:
         cmd = [CLAUDE_BIN] + (extra_args or [])
         self._launch(cmd, env)
 
-    def migrate(self, session: Session, to_profile_name: str, to_config_dir: Path) -> Session:
-        return self._history.migrate_session(session, to_profile_name, to_config_dir)
+    def migrate(
+        self, session: Session, to_profile_name: str, to_config_dir: Path, strip: bool = True
+    ) -> Session:
+        return self._history.migrate_session(session, to_profile_name, to_config_dir, strip=strip)
 
     def _launch(self, cmd: list[str], env: dict) -> None:
         if sys.platform != "win32":

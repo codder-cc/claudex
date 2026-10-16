@@ -718,8 +718,14 @@ def session_resume(name: Optional[str], from_profile: Optional[str], session_id:
 @click.argument("session_id")
 @click.option("--from", "from_profile", required=True, help="Source profile name")
 @click.option("--to", "to_profile", required=True, help="Destination profile name")
-def session_migrate(session_id: str, from_profile: str, to_profile: str) -> None:
-    """Migrate a session from one profile to another."""
+@click.option("--keep-thinking", is_flag=True,
+              help="Copy thinking blocks verbatim (only safe between profiles of the same account)")
+def session_migrate(session_id: str, from_profile: str, to_profile: str, keep_thinking: bool) -> None:
+    """Migrate a session from one profile to another.
+
+    Like a switch, thinking / redacted_thinking blocks are stripped: their
+    signatures are bound to the source account and another account rejects them.
+    """
     pm = _pm()
     from claudex.history.browser import HistoryBrowser
     try:
@@ -738,7 +744,9 @@ def session_migrate(session_id: str, from_profile: str, to_profile: str) -> None
                           f"{len(candidates)} sessions. Use a longer id (try --full-id).")
             sys.exit(1)
         to_prof = pm.get(to_profile)
-        new_session = browser.migrate_session(candidates[0], to_profile, to_prof.config_dir)
+        new_session = browser.migrate_session(
+            candidates[0], to_profile, to_prof.config_dir, strip=not keep_thinking
+        )
     except (ClaudexError, FileExistsError, ValueError) as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
