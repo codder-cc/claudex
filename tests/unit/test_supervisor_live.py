@@ -189,3 +189,24 @@ def test_proxy_override_controls_base_url(env, monkeypatch):
     sup2 = Supervisor("incr", pm=pm, proxy_override=False, install_hook=False)
     env3 = sup2._env_for(str(pm.get("incr").config_dir), "incr")
     assert "ANTHROPIC_BASE_URL" not in env3
+
+
+def test_terminate_child_escalates_to_sigkill(env, tmp_path):
+    """A child that traps/ignores SIGTERM (like claude 2.1.x) must still be
+    killed so a switch can proceed instead of blocking forever."""
+    import sys
+    import subprocess
+    from claudex.core.supervisor import Supervisor
+    _, pm = env
+    pm.create("incr")
+    script = tmp_path / "ignore_term.py"
+    script.write_text(
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, lambda *a: None)\n"   # swallow SIGTERM
+        "time.sleep(60)\n"
+    )
+    child = subprocess.Popen([sys.executable, str(script)])
+    sup = Supervisor("incr", pm=pm, install_hook=False, term_grace=0.5)
+    sup._terminate_child(child)
+    child.wait(timeout=5)                 # must have been force-killed
+    assert child.returncode is not None   # it died, not hung

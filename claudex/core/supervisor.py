@@ -309,6 +309,7 @@ class Supervisor:
         claude_bin: str = CLAUDE_BIN,
         install_hook: bool = True,
         proxy_override: Optional[bool] = None,
+        term_grace: float = 4.0,
     ) -> None:
         validate_profile_name(profile_name)
         self.pm = pm or ProfileManager()
@@ -326,6 +327,8 @@ class Supervisor:
         self._hooked_dirs: set[Path] = set()
         self._child: Optional[subprocess.Popen] = None
         self._shutdown = False
+        # Seconds to wait for claude's graceful SIGTERM shutdown before SIGKILL.
+        self._term_grace = term_grace
         # None → honor each profile's stored flag; True/False → force for this run.
         self._proxy_override = proxy_override
 
@@ -462,6 +465,28 @@ class Supervisor:
             env.update(proxy_env(base))
         return env
 
+    def _terminate_child(self, child: subprocess.Popen) -> None:
+        """Stop the claude child for a switch: SIGTERM for a graceful exit, then
+        SIGKILL if it doesn't die within the grace period.
+
+        Claude 2.1.x traps SIGTERM (``gracefulShutdown``) and does NOT reliably
+        exit on it at the interactive prompt — without escalation the supervisor
+        would block forever in ``child.wait()`` and the switch would never apply.
+        """
+        try:
+            child.send_signal(signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+        deadline = time.monotonic() + self._term_grace
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                return  # exited gracefully
+            time.sleep(0.1)
+        try:
+            child.kill()  # SIGKILL — guarantees the switch proceeds
+        except (ProcessLookupError, OSError):
+            pass
+
     def _run_child_until_switch_or_exit(
         self, cmd: list[str], config_dir: str, profile: str,
     ) -> tuple[Optional[SwitchRequest], int]:
@@ -493,10 +518,7 @@ class Supervisor:
                         self.request_path.unlink()
                     except OSError:
                         pass
-                    try:
-                        child.send_signal(signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                    self._terminate_child(child)  # SIGTERM → SIGKILL escalation
                     return
                 time.sleep(self.poll_seconds)
 
@@ -518,11 +540,12 @@ class Supervisor:
         """
         def _on_signal(_signum, _frame):
             self._shutdown = True
-            if self._child is not None:
-                try:
-                    self._child.send_signal(signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass
+            child = self._child
+            if child is not None:
+                # Escalate in a background thread so the supervisor exits even if
+                # claude traps SIGTERM (gracefulShutdown) and doesn't die.
+                threading.Thread(target=self._terminate_child, args=(child,),
+                                 daemon=True).start()
         for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
             if sig is None:
                 continue
