@@ -419,6 +419,128 @@ def auth_add(name: str) -> None:
         sys.exit(1)
 
 
+@auth_group.command("remote")
+@click.argument("name")
+@click.option("--ttl", type=int, default=15, show_default=True, help="Minutes the drop stays open")
+@click.option("--print-only", is_flag=True, help="Print the one-liner and exit; collect later with `auth collect`")
+@click.option("--endpoint", "-e", default=None, help="Sharing server URL (overrides config)")
+def auth_remote(name: str, ttl: int, print_only: bool, endpoint: Optional[str]) -> None:
+    """Log in on ANOTHER machine; the credentials land in profile NAME here.
+
+    Prints one line to run on the other machine (`claudex auth fulfill …`,
+    `aimux auth fulfill …` works with the same token). That machine performs
+    the normal `claude /login` and uploads the sealed credentials; this
+    command waits, installs them into the profile and deletes the drop. The
+    other machine needs no account on the sharing server.
+    """
+    from claudex.core.drops import request_drop, wait_for_drop
+    from claudex.core.sharing_client import SharingAPIError
+
+    ep = _resolve_endpoint(endpoint)
+    try:
+        req = request_drop(name, ep, ttl_minutes=ttl)
+    except (ClaudexError, RuntimeError, SharingAPIError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    console.print(f"[cyan]Drop created for profile[/cyan] [bold]{name}[/bold]; open for {ttl} min.")
+    console.print("Run this on the machine where you can log in:\n")
+    console.print(f"  [green bold]claudex auth fulfill {req.token}[/green bold]\n")
+    if print_only:
+        _save_pending_drop(req)
+        console.print(f"Then collect it here with: [cyan]claudex auth collect {name}[/cyan]")
+        return
+    console.print("Waiting for the other machine… (Ctrl-C to stop; the drop stays open until it expires)")
+    try:
+        profile = wait_for_drop(req, timeout_s=ttl * 60 + 30, on_tick=lambda: console.print(".", end=""))
+    except (ClaudexError, SharingAPIError) as e:
+        console.print(f"\n[red]Error:[/red] {e}")
+        sys.exit(1)
+    console.print()
+    _seed_claude_json(profile.config_dir, seed_identity=False)
+    console.print(f"[green]✓[/green] Profile '{profile.name}' authenticated ({profile.auth_type}"
+                  f"{', ' + profile.email if profile.email else ''})")
+
+
+@auth_group.command("collect")
+@click.argument("name")
+@click.option("--timeout", type=int, default=0, help="Seconds to wait (default: until the drop expires)")
+def auth_collect(name: str, timeout: int) -> None:
+    """Collect a drop started earlier with `claudex auth remote NAME --print-only`."""
+    from claudex.core.drops import wait_for_drop
+    from claudex.core.sharing_client import SharingAPIError
+
+    req = _load_pending_drop(name)
+    if req is None:
+        console.print(f"[red]No pending drop for profile '{name}'[/red]")
+        sys.exit(1)
+    try:
+        profile = wait_for_drop(req, timeout_s=timeout or 3600)
+    except (ClaudexError, SharingAPIError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    _clear_pending_drop(name)
+    _seed_claude_json(profile.config_dir, seed_identity=False)
+    console.print(f"[green]✓[/green] Profile '{profile.name}' authenticated ({profile.auth_type})")
+
+
+@auth_group.command("fulfill")
+@click.argument("token", required=False, default=None)
+def auth_fulfill(token: Optional[str]) -> None:
+    """Run `claude /login` HERE for a drop created on another machine.
+
+    TOKEN is the `axd_…` argument printed by `auth remote` there (claudex or
+    aimux). Omit it to paste it at a prompt, keeping it out of shell history.
+    Needs no account on the sharing server. Temporary files are removed.
+    """
+    from claudex.core.drops import fulfill_drop
+    from claudex.core.sharing_client import SharingAPIError
+
+    if not token:
+        token = click.prompt("Drop token", hide_input=True)
+    try:
+        fulfill_drop(token.strip(), on_status=lambda m: console.print(f"[cyan]{m}[/cyan]"))
+    except (ClaudexError, SharingAPIError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    console.print("[green]✓[/green] Credentials delivered. You can close this terminal.")
+
+
+def _pending_drop_path(name: str) -> Path:
+    import claudex.constants as _C
+    return _C.CLAUDEX_HOME / ".drops" / f"pending-{name}.json"
+
+
+def _save_pending_drop(req) -> None:
+    import json
+    from dataclasses import asdict
+
+    path = _pending_drop_path(req.profile_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(req)), encoding="utf-8")
+    try:
+        path.chmod(0o600)  # holds the private key
+    except OSError:
+        pass
+
+
+def _load_pending_drop(name: str):
+    import json
+
+    from claudex.core.drops import DropRequest
+
+    path = _pending_drop_path(name)
+    if not path.exists():
+        return None
+    try:
+        return DropRequest(**json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _clear_pending_drop(name: str) -> None:
+    _pending_drop_path(name).unlink(missing_ok=True)
+
+
 @auth_group.command("key")
 @click.argument("name")
 @click.option("--key", "-k", prompt="API key (sk-ant-...)", hide_input=True)

@@ -184,6 +184,34 @@ class SharingClient:
             headers=self._auth_header,
         )
 
+    # ── auth drops (remote-login hand-off; see claudex.core.drops) ───────────
+    def create_drop(self, label: str, backend: str = "claude", ttl_minutes: int = 15) -> dict:
+        payload = {"label": label, "backend": backend, "ttl_minutes": int(ttl_minutes)}
+        return _http("POST", self._url("/api/v1/claudex/drops"), data=payload, headers=self._auth_header)
+
+    def get_drop(self, drop_id: str) -> Optional[dict]:
+        """The filled drop, or None while the other machine has not written yet (204)."""
+        data = _http("GET", self._url(f"/api/v1/claudex/drops/{drop_id}"), headers=self._auth_header)
+        return data or None
+
+    def delete_drop(self, drop_id: str) -> None:
+        _http("DELETE", self._url(f"/api/v1/claudex/drops/{drop_id}"), headers=self._auth_header)
+
+    def list_drops(self) -> List[dict]:
+        data = _http("GET", self._url("/api/v1/claudex/drops"), headers=self._auth_header)
+        return data.get("drops", [])
+
+
+def fill_drop(endpoint: str, drop_id: str, write_token: str, ciphertext: bytes,
+              backend: str = "claude") -> dict:
+    """Write-once upload from the machine that performed the login. No account
+    needed: the single-use write token (header X-Drop-Token) is the credential."""
+    import base64
+
+    payload = {"encrypted_data": base64.b64encode(ciphertext).decode("ascii"), "backend": backend}
+    return _http("PUT", endpoint.rstrip("/") + f"/api/v1/claudex/drops/{drop_id}", data=payload,
+                 headers={"X-Drop-Token": write_token})
+
 
 def login(endpoint: str, username: str, password: str) -> SharingClient:
     """Authenticate to the sharing endpoint and persist credentials.

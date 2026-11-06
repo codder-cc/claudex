@@ -123,6 +123,8 @@ claudex share push <name>       Encrypt and upload a profile; prints share token
 claudex share pull <token> <n>  Download and decrypt a profile to a new name
 claudex share list              List your uploaded shares
 claudex share revoke <id>       Revoke an uploaded share
+claudex auth remote <name>      Log in on another machine; credentials land here
+claudex auth fulfill [token]    Run on the other machine: `claude /login` + sealed upload
 
 claudex fleet dispatch "<p>"    Run a headless `claude -p` job (auto-picks a profile)
 claudex fleet status [job]      Show one job or a table of all
