@@ -329,6 +329,20 @@ class AsyncProxyServer:
                 if name.lower() in _HOP_BY_HOP:
                     continue
                 cwriter.write(f"{name}: {value}\r\n".encode("latin-1"))
+            # This proxy serves exactly ONE request per client connection and
+            # closes it in `finally`. The upstream `connection` header was dropped
+            # as hop-by-hop above, so without this the client sees a bare HTTP/1.1
+            # response, assumes keep-alive (undici does by default), and reuses
+            # this already-closed socket for its next request — tool_use loops,
+            # MCP chains and agentic multi-call turns send several requests over
+            # one keep-alive connection, so the 2nd+ request hits a dead socket,
+            # its response never arrives, and Claude Code hangs forever
+            # ("thinking", "tools don't work"). Advertising close makes the client
+            # open a fresh connection per request; the upstream keep-alive pool is
+            # unaffected. (Full client-side keep-alive was tried and flaked on
+            # idle-connection / EOF-framing edge cases; one-shot is correct and
+            # the localhost perf cost is negligible.)
+            cwriter.write(b"Connection: close\r\n")
             cwriter.write(b"\r\n")
             await cwriter.drain()
 

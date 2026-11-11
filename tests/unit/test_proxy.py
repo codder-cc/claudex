@@ -103,6 +103,35 @@ def test_start_background_returns_running_url():
 
 @pytest.mark.skipif(os.environ.get("CLAUDEX_NET_TESTS") != "1",
                     reason="network test; set CLAUDEX_NET_TESTS=1 to run")
+def test_proxy_response_advertises_connection_close():
+    """One-shot connection: the proxy must tell the client to NOT keep-alive,
+    else undici reuses the already-closed socket for its next request (tool_use
+    loops / MCP) and hangs. Checked via a raw socket against the real 401 path."""
+    import socket
+    srv, _thread, base = proxy.start_background(port=0)
+    try:
+        host, port = srv.server_address
+        s = socket.create_connection((host, port), timeout=20)
+        payload = b'{"model":"x","max_tokens":1,"messages":[]}'
+        s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                  b"content-type: application/json\r\nanthropic-version: 2023-06-01\r\n"
+                  b"content-length: %d\r\n\r\n" % len(payload) + payload)
+        s.settimeout(20)
+        resp = b""
+        while b"\r\n\r\n" not in resp and len(resp) < 8192:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        s.close()
+        head = resp.split(b"\r\n\r\n", 1)[0].decode("latin-1").lower()
+        assert "connection: close" in head
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.skipif(os.environ.get("CLAUDEX_NET_TESTS") != "1",
+                    reason="network test; set CLAUDEX_NET_TESTS=1 to run")
 def test_proxy_forwards_to_real_api():
     """An unauthenticated request should come back as a genuine Anthropic 401."""
     srv, thread, base = proxy.start_background(port=0)
