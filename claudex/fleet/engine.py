@@ -18,7 +18,7 @@ from typing import Callable, Optional
 from claudex.constants import IS_WINDOWS
 from claudex.core.auth import AuthManager
 from claudex.core.profile import ProfileManager
-from claudex.exceptions import JobNotFoundError
+from claudex.exceptions import FleetError, JobNotFoundError
 from claudex.fleet import runner
 from claudex.fleet.models import (
     FAIL_ERROR,
@@ -26,6 +26,7 @@ from claudex.fleet.models import (
     JobResult,
     JobStatus,
     _now,
+    new_thread_id,
 )
 from claudex.fleet.scheduler import Scheduler
 from claudex.fleet.store import FleetStore, is_pid_alive
@@ -78,6 +79,8 @@ class FleetEngine:
         output_format: str = "json",
         extra_args: Optional[list[str]] = None,
         parent_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        resume_session: Optional[str] = None,
         auto_tick: bool = True,
     ) -> Job:
         job = Job(
@@ -90,6 +93,8 @@ class FleetEngine:
             output_format=output_format,
             extra_args=list(extra_args or []),
             parent_id=parent_id,
+            thread_id=thread_id,
+            resume_session=resume_session,
         )
         self.store.save_job(job)
         if auto_tick:
@@ -131,6 +136,103 @@ class FleetEngine:
         self.tick()
         refreshed = self.store.load_job(parent.id)
         return refreshed or parent
+
+    # ── conversation threads (mode A — resume pseudo-stream) ─────────────────--
+    def thread_turns(self, thread_id: str) -> list[Job]:
+        """All jobs in a thread, oldest first."""
+        return [j for j in self.store.list_jobs(include_orchestrators=False)
+                if j.thread_id == thread_id]
+
+    def continue_thread(
+        self,
+        ref: str,
+        prompt: str,
+        model: Optional[str] = None,
+        timeout_s: Optional[int] = None,
+        auto_tick: bool = True,
+    ) -> Job:
+        """Add a turn to an existing conversation.
+
+        *ref* is a thread id (``th_…``) or any job id in the thread. The new turn
+        resumes the latest finished turn's Claude session and is pinned to the same
+        profile (the transcript lives in that profile's config dir). Raises if the
+        latest turn has not finished, failed, or produced no resumable session id.
+        """
+        if auto_tick:
+            self.tick()
+
+        # Resolve the thread and its turns.
+        turns: list[Job]
+        if ref.startswith("th_"):
+            thread_id = ref
+            turns = self.thread_turns(thread_id)
+            if not turns:
+                raise JobNotFoundError(ref)
+        else:
+            resolved = self.store.resolve_job_id(ref)
+            seed = self.store.load_job(resolved) if resolved else None
+            if seed is None:
+                raise JobNotFoundError(ref)
+            if seed.thread_id:
+                thread_id = seed.thread_id
+                turns = self.thread_turns(thread_id)
+            else:
+                # A plain dispatched job becomes the seed of a new thread; backfill
+                # its thread_id so the whole chain is coherent from here on.
+                thread_id = new_thread_id()
+                seed.thread_id = thread_id
+                self.store.save_job(seed)
+                turns = [seed]
+
+        latest = turns[-1]
+        if not latest.is_terminal():
+            raise FleetError(
+                f"thread {thread_id}: latest turn {latest.id} is still "
+                f"{latest.status.value}; wait for it before continuing"
+            )
+        if latest.status != JobStatus.SUCCEEDED:
+            raise FleetError(
+                f"thread {thread_id}: latest turn {latest.id} ended "
+                f"{latest.status.value}; cannot resume a non-succeeded turn"
+            )
+        result = self.store.load_result(latest.id)
+        session_id = result.session_id if result else None
+        if not session_id:
+            raise FleetError(
+                f"thread {thread_id}: latest turn {latest.id} produced no "
+                f"session id to resume (was it run with --output-format json?)"
+            )
+
+        return self.dispatch(
+            prompt,
+            profile=latest.profile,         # pin: transcript lives in this profile
+            cwd=latest.cwd,
+            model=model or latest.model,
+            timeout_s=timeout_s if timeout_s is not None else latest.timeout_s,
+            thread_id=thread_id,
+            resume_session=session_id,
+            auto_tick=auto_tick,
+        )
+
+    def start_thread(
+        self,
+        prompt: str,
+        profile: Optional[str] = None,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout_s: Optional[int] = None,
+        auto_tick: bool = True,
+    ) -> Job:
+        """Dispatch the first turn of a new conversation thread."""
+        return self.dispatch(
+            prompt,
+            profile=profile,
+            cwd=cwd,
+            model=model,
+            timeout_s=timeout_s,
+            thread_id=new_thread_id(),
+            auto_tick=auto_tick,
+        )
 
     def status(self, job_id: str, tick_first: bool = True) -> Job:
         if tick_first:

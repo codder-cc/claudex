@@ -33,6 +33,11 @@ def new_job_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def new_thread_id() -> str:
+    """Identifier for a conversation thread (chain of resume-linked jobs)."""
+    return "th_" + uuid.uuid4().hex[:8]
+
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     ASSIGNED = "assigned"
@@ -78,6 +83,14 @@ class Job:
 
     child_ids: list[str] = field(default_factory=list)  # for orchestrator jobs
 
+    # Conversation threading (mode A — resume pseudo-stream). A thread is a chain
+    # of jobs sharing one Claude Code session: each turn after the first resumes
+    # the prior turn's session_id so context carries across jobs without keeping
+    # a process alive. All turns in a thread are pinned to the same profile (the
+    # transcript lives in that profile's config dir).
+    thread_id: Optional[str] = None
+    resume_session: Optional[str] = None  # claude session_id to --resume into
+
     TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
 
     def is_terminal(self) -> bool:
@@ -117,6 +130,8 @@ class Job:
             "output_format": self.output_format,
             "timeout_s": self.timeout_s,
             "child_ids": self.child_ids,
+            "thread_id": self.thread_id,
+            "resume_session": self.resume_session,
         }
 
     @classmethod
@@ -143,6 +158,8 @@ class Job:
             output_format=data.get("output_format", "json"),
             timeout_s=data.get("timeout_s"),
             child_ids=list(data.get("child_ids", [])),
+            thread_id=data.get("thread_id"),
+            resume_session=data.get("resume_session"),
         )
 
 

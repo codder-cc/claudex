@@ -2039,6 +2039,56 @@ def _wait_for_job(eng, job_id: str, max_wait_s: int = 1800) -> None:
         console.print(f"[red]{res.error}[/red]")
 
 
+@fleet_group.command("chat")
+@click.argument("prompt")
+@click.option("--profile", "-p", default=None, help="Pin to a profile (default: auto-select)")
+@click.option("--cwd", default=None, help="Working directory for the agent")
+@click.option("--model", "-m", default=None, help="Model to use (passed to claude --model)")
+@click.option("--timeout", "timeout_s", type=int, default=None, help="Per-turn timeout in seconds")
+@click.option("--wait", is_flag=True, help="Block until this turn finishes")
+def fleet_chat(prompt, profile, cwd, model, timeout_s, wait) -> None:
+    """Start a conversation thread (mode A: resume pseudo-stream).
+
+    The thread keeps context across turns by resuming the prior turn's session.
+    Continue it with: claudex fleet say <thread> "<next prompt>"
+    """
+    eng = _engine()
+    job = eng.start_thread(prompt, profile=profile, cwd=cwd, model=model, timeout_s=timeout_s)
+    console.print(f"[green]✓[/green] Thread [bold]{job.thread_id}[/bold] "
+                  f"started · turn [bold]{job.id}[/bold] "
+                  f"[{_status_style(job.status.value)}]{job.status.value}[/] "
+                  f"→ profile [bold]{job.profile or '—'}[/bold]")
+    console.print(f"[dim]continue: claudex fleet say {job.thread_id} \"<next prompt>\"[/dim]")
+    if wait:
+        _wait_for_job(eng, job.id)
+
+
+@fleet_group.command("say")
+@click.argument("thread")
+@click.argument("prompt")
+@click.option("--model", "-m", default=None, help="Override the model for this turn")
+@click.option("--timeout", "timeout_s", type=int, default=None, help="Per-turn timeout in seconds")
+@click.option("--wait", is_flag=True, help="Block until this turn finishes")
+def fleet_say(thread, prompt, model, timeout_s, wait) -> None:
+    """Add a turn to a conversation thread, resuming its context.
+
+    THREAD is a thread id (th_…) or any job id in the thread.
+    """
+    eng = _engine()
+    try:
+        job = eng.continue_thread(thread, prompt, model=model, timeout_s=timeout_s)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] Thread [bold]{job.thread_id}[/bold] "
+                  f"· turn [bold]{job.id}[/bold] "
+                  f"[{_status_style(job.status.value)}]{job.status.value}[/] "
+                  f"→ profile [bold]{job.profile or '—'}[/bold] "
+                  f"[dim](resumes {job.resume_session[:8] if job.resume_session else '—'})[/dim]")
+    if wait:
+        _wait_for_job(eng, job.id)
+
+
 @fleet_group.command("status")
 @click.argument("job_id", required=False)
 def fleet_status(job_id) -> None:
@@ -2056,6 +2106,9 @@ def fleet_status(job_id) -> None:
             console.print(f"  parent  : {job.parent_id}")
         if job.child_ids:
             console.print(f"  children: {', '.join(job.child_ids)}")
+        if job.thread_id:
+            console.print(f"  thread  : {job.thread_id}"
+                          + (f" (resumes {job.resume_session[:8]})" if job.resume_session else ""))
         console.print(f"  prompt  : {job.prompt[:120]}")
         return
     _print_job_table(eng.list_jobs())

@@ -38,7 +38,22 @@ from claudex.fleet.store import FleetStore
 
 
 def _claudex_command() -> list[str]:
-    """How to re-invoke claudex for the detached worker."""
+    """How to re-invoke claudex for the detached worker.
+
+    Prefer the *current* interpreter (`python -m claudex.cli`) so the worker runs
+    the exact same code as the dispatcher. A `claudex` console-script on PATH may
+    point at a different install (dev checkout vs pipx, or a version skew during an
+    upgrade); if the worker runs older code it silently drops Job fields it does
+    not know about when it round-trips the job file (e.g. thread_id/resume_session
+    → broken conversation threads). Fall back to the PATH script only if this
+    interpreter cannot import claudex.
+    """
+    try:
+        import importlib.util
+        if importlib.util.find_spec("claudex") is not None:
+            return [sys.executable, "-m", "claudex.cli"]
+    except Exception:
+        pass
     exe = shutil.which("claudex")
     if exe:
         return [exe]
@@ -101,6 +116,10 @@ def build_claude_env(auth: AuthManager, profile_name: str, config_dir: Path) -> 
 
 def _build_cmd(job: Job) -> list[str]:
     cmd = [CLAUDE_BIN, "-p", job.prompt, "--output-format", job.output_format]
+    if job.resume_session:
+        # Continue the thread's conversation: Claude Code reloads this session's
+        # transcript from the profile's config dir and appends this turn to it.
+        cmd += ["--resume", job.resume_session]
     if job.model:
         cmd += ["--model", job.model]
     cmd += job.extra_args
