@@ -2240,6 +2240,135 @@ def fleet_live_ls() -> None:
     console.print(table)
 
 
+@fleet_group.command("streamd")
+@click.option("--start", is_flag=True, help="Start the resident stream daemon")
+@click.option("--stop", is_flag=True, help="Stop the resident stream daemon")
+@click.option("--status", "show_status", is_flag=True, help="Show daemon status")
+def fleet_streamd(start, stop, show_status) -> None:
+    """Manage the resident stream daemon (mode C).
+
+    One daemon hosts many live sessions that outlive the CLI invocation. Sessions
+    are created with `fleet open` and driven with `fleet ask`/`interrupt`/`close`.
+    """
+    from claudex.fleet import streamd as _sd
+    if stop:
+        ok = _sd.stop_daemon()
+        console.print("[green]✓ stopped[/green]" if ok else "[yellow]not running[/yellow]")
+        return
+    if start:
+        sock = _sd.ensure_daemon()
+        if sock:
+            console.print(f"[green]✓[/green] stream daemon running [dim]({sock})[/dim]")
+        else:
+            console.print("[red]failed to start stream daemon[/red]")
+            raise SystemExit(1)
+        return
+    # default / --status
+    st = _sd.status()
+    if st.get("running"):
+        console.print(f"[green]running[/green] · pid {st['pid']} · [dim]{st['sock']}[/dim]")
+    else:
+        console.print("[yellow]not running[/yellow] — start: claudex fleet streamd --start")
+
+
+@fleet_group.command("_streamd-run", hidden=True)
+def fleet_streamd_run() -> None:
+    """Daemon body (internal); launched detached by ensure_daemon()."""
+    from claudex.fleet import streamd as _sd
+    _sd.run_daemon()
+
+
+@fleet_group.command("open")
+@click.option("--profile", "-p", required=True, help="Profile to run the session as")
+@click.option("--model", "-m", default=None, help="Model to use")
+@click.option("--cwd", default=None, help="Working directory for the agent")
+def fleet_open(profile, model, cwd) -> None:
+    """Open a live session in the resident daemon (mode C). Prints its id."""
+    from claudex.fleet import streamd as _sd
+    resp = _sd.send_command({"cmd": "open", "profile": profile, "model": model,
+                             "cwd": cwd or os.getcwd()})
+    if not resp.get("ok"):
+        console.print(f"[red]{resp.get('error')}[/red]")
+        raise SystemExit(1)
+    sid = resp["id"]
+    console.print(f"[green]✓[/green] Session [bold]{sid}[/bold] "
+                  f"→ profile [bold]{profile}[/bold]"
+                  + (f" · model [bold]{model}[/bold]" if model else ""))
+    console.print(f"[dim]ask: claudex fleet ask {sid} \"<prompt>\"  ·  "
+                  f"close: claudex fleet close {sid}[/dim]")
+
+
+@fleet_group.command("ask")
+@click.argument("session_id")
+@click.argument("prompt")
+@click.option("--timeout", type=int, default=600, help="Max seconds to wait for the turn")
+def fleet_ask(session_id, prompt, timeout) -> None:
+    """Send a prompt to a daemon session and print the reply (keeps context)."""
+    from claudex.fleet import streamd as _sd
+    resp = _sd.send_command({"cmd": "ask", "id": session_id, "prompt": prompt,
+                             "timeout": timeout}, timeout=timeout + 20)
+    if not resp.get("ok"):
+        console.print(f"[red]{resp.get('error')}[/red]")
+        raise SystemExit(1)
+    if resp.get("is_error"):
+        console.print(f"[red]{resp.get('text') or 'error'}[/red]")
+        raise SystemExit(1)
+    console.print(resp.get("text", ""))
+    if resp.get("cost_usd") is not None:
+        console.print(f"[dim]cost ${resp['cost_usd']:.4f} · {resp.get('num_turns')} turns[/dim]")
+
+
+@fleet_group.command("interrupt")
+@click.argument("session_id")
+def fleet_interrupt(session_id) -> None:
+    """Abort the in-flight turn of a daemon session."""
+    from claudex.fleet import streamd as _sd
+    resp = _sd.send_command({"cmd": "interrupt", "id": session_id}, timeout=10)
+    if not resp.get("ok"):
+        console.print(f"[red]{resp.get('error')}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] interrupt sent to [bold]{session_id}[/bold]")
+
+
+@fleet_group.command("close")
+@click.argument("session_id")
+def fleet_close(session_id) -> None:
+    """Close a daemon session."""
+    from claudex.fleet import streamd as _sd
+    resp = _sd.send_command({"cmd": "close", "id": session_id}, timeout=20)
+    if not resp.get("ok"):
+        console.print(f"[red]{resp.get('error')}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] closed [bold]{session_id}[/bold] "
+                  f"[dim](exit {resp.get('exit_code')}, {resp.get('turns')} turns)[/dim]")
+
+
+@fleet_group.command("sessions")
+def fleet_sessions() -> None:
+    """List live sessions hosted by the resident daemon."""
+    from claudex.fleet import streamd as _sd
+    if not _sd.status().get("running"):
+        console.print("[yellow]stream daemon not running.[/yellow]")
+        return
+    resp = _sd.send_command({"cmd": "list"}, auto_start=False, timeout=10)
+    rows = resp.get("sessions", []) if resp.get("ok") else []
+    if not rows:
+        console.print("[yellow]No daemon sessions.[/yellow] Open one: "
+                      "claudex fleet open -p <profile>")
+        return
+    table = Table(title="Daemon sessions", show_header=True, header_style="bold cyan")
+    table.add_column("ID", style="bold")
+    table.add_column("Profile")
+    table.add_column("Model")
+    table.add_column("Turns")
+    table.add_column("State")
+    for s in rows:
+        table.add_row(s.get("id", "—"), s.get("profile", "—"), s.get("model") or "—",
+                      str(s.get("turns", 0)),
+                      "[green]alive[/green]" if s.get("alive") else "[red]dead[/red]")
+    console.print(table)
+
+
 @fleet_group.command("status")
 @click.argument("job_id", required=False)
 def fleet_status(job_id) -> None:

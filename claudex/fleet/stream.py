@@ -168,6 +168,22 @@ class StreamSession:
         stdin.write(encode_user_message(prompt))
         stdin.flush()
 
+    def interrupt(self) -> None:
+        """Ask Claude Code to abort the in-flight turn (stream-json control msg)."""
+        if self._closed:
+            return
+        stdin = self._proc.stdin
+        if stdin is None:
+            return
+        import uuid as _uuid
+        msg = {
+            "type": "control_request",
+            "request_id": "int_" + _uuid.uuid4().hex[:8],
+            "request": {"subtype": "interrupt"},
+        }
+        stdin.write(json.dumps(msg) + "\n")
+        stdin.flush()
+
     def wait_turn(self, timeout: Optional[float] = None) -> TurnResult:
         """Block until the next turn's result arrives."""
         return self._results.get(timeout=timeout)
