@@ -2089,6 +2089,157 @@ def fleet_say(thread, prompt, model, timeout_s, wait) -> None:
         _wait_for_job(eng, job.id)
 
 
+@fleet_group.command("live")
+@click.option("--profile", "-p", required=True, help="Profile to run the live session as")
+@click.option("--cwd", default=None, help="Working directory for the agent")
+@click.option("--model", "-m", default=None, help="Model to use (passed to claude --model)")
+@click.option("--turn-timeout", type=int, default=600, help="Max seconds to wait per turn")
+def fleet_live(profile, cwd, model, turn_timeout) -> None:
+    """Open a live streaming session (mode B): one process, many prompts.
+
+    Keeps a single `claude` process alive and streams prompts into it, so context
+    and MCP stay warm across turns. Type prompts at the prompt; another terminal
+    can inject prompts with: claudex fleet tell <id> "<prompt>". /exit to quit.
+    """
+    import sys as _sys
+    import threading as _th
+    from claudex.constants import IS_WINDOWS
+    from claudex.fleet import stream as _stream
+    from claudex.fleet.models import new_job_id
+    from claudex.fleet.runner import build_claude_env
+
+    if IS_WINDOWS:
+        console.print("[red]live mailbox is POSIX-only; use mode C on Windows.[/red]")
+        raise SystemExit(1)
+
+    try:
+        prof = _pm().get(profile)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    env = build_claude_env(_auth(), profile, prof.config_dir)
+    sid = new_job_id()
+    log_file = _stream.live_log_path(sid)
+    work_dir = cwd or os.getcwd()
+
+    try:
+        fifo = _stream.make_fifo(sid)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    session = _stream.StreamSession.spawn(
+        env=env, cwd=work_dir, model=model, log_file=log_file,
+    )
+    _stream.register_live(sid, {
+        "id": sid, "profile": profile, "pid": os.getpid(),
+        "cwd": work_dir, "model": model, "fifo": str(fifo),
+    })
+
+    console.print(f"[green]✓[/green] Live session [bold]{sid}[/bold] "
+                  f"→ profile [bold]{profile}[/bold]"
+                  + (f" · model [bold]{model}[/bold]" if model else ""))
+    console.print(f"[dim]inject from elsewhere: claudex fleet tell {sid} \"<prompt>\"[/dim]")
+    console.print(f"[dim]type a prompt, or /exit to quit[/dim]")
+
+    turn_lock = _th.Lock()
+    stop = _th.Event()
+
+    def handle(prompt: str, source: str) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            return
+        with turn_lock:
+            if not session.is_alive():
+                console.print("[red]session ended.[/red]")
+                stop.set()
+                return
+            try:
+                res = session.ask(prompt, timeout=turn_timeout)
+            except Exception as e:
+                console.print(f"[red]turn failed: {e}[/red]")
+                return
+            tag = "[cyan]mailbox[/cyan]" if source == "mailbox" else "[green]you[/green]"
+            if source == "mailbox":
+                console.print(f"\n{tag} ◂ {prompt}")
+            if res.is_error:
+                console.print(f"[red]{res.text or 'error'}[/red]")
+            else:
+                console.print(res.text)
+
+    def mailbox_loop() -> None:
+        # O_RDWR keeps the FIFO open across writers (no EOF storms between tells).
+        try:
+            fd = os.open(str(fifo), os.O_RDWR)
+        except Exception:
+            return
+        with os.fdopen(fd, "r") as f:
+            while not stop.is_set():
+                line = f.readline()
+                if line == "":
+                    break
+                handle(line, "mailbox")
+
+    mb = _th.Thread(target=mailbox_loop, daemon=True)
+    mb.start()
+
+    try:
+        while not stop.is_set():
+            try:
+                line = input("› ")
+            except EOFError:
+                break
+            if line.strip() in ("/exit", "/quit", "/q"):
+                break
+            handle(line, "you")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        code = session.close()
+        _stream.unregister_live(sid)
+        console.print(f"[dim]session {sid} closed (exit {code}).[/dim]")
+
+
+@fleet_group.command("tell")
+@click.argument("session_id")
+@click.argument("prompt")
+def fleet_tell(session_id, prompt) -> None:
+    """Inject a prompt into a running live session's mailbox."""
+    from claudex.fleet import stream as _stream
+    try:
+        _stream.tell(session_id, prompt)
+    except (FileNotFoundError, TimeoutError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] sent to live session [bold]{session_id}[/bold]")
+
+
+@fleet_group.command("live-ls")
+def fleet_live_ls() -> None:
+    """List live streaming sessions."""
+    from claudex.fleet import stream as _stream
+    sessions = _stream.list_live()
+    if not sessions:
+        console.print("[yellow]No live sessions.[/yellow] Start one: "
+                      "claudex fleet live -p <profile>")
+        return
+    table = Table(title="Live sessions", show_header=True, header_style="bold cyan")
+    table.add_column("ID", style="bold")
+    table.add_column("Profile")
+    table.add_column("Model")
+    table.add_column("PID")
+    table.add_column("State")
+    for s in sessions:
+        table.add_row(
+            s.get("id", "—"), s.get("profile", "—"), s.get("model") or "—",
+            str(s.get("pid", "—")),
+            "[green]alive[/green]" if s.get("alive") else "[red]dead[/red]",
+        )
+    console.print(table)
+
+
 @fleet_group.command("status")
 @click.argument("job_id", required=False)
 def fleet_status(job_id) -> None:
