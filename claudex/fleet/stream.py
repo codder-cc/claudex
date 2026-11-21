@@ -104,6 +104,8 @@ class StreamSession:
     def __init__(self, proc, *, log_file: Optional[Path] = None,
                  on_event: Optional[Callable[[dict], None]] = None) -> None:
         self._proc = proc
+        if log_file:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         self._log = open(log_file, "a", encoding="utf-8") if log_file else None
         self._on_event = on_event
         self._results: "queue.Queue[TurnResult]" = queue.Queue()
