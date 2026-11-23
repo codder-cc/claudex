@@ -505,6 +505,126 @@ def auth_fulfill(token: Optional[str]) -> None:
     console.print("[green]✓[/green] Credentials delivered. You can close this terminal.")
 
 
+@auth_group.command("login-tunnel")
+@click.option("--peer", "ref", default=None, help="LAN peer (host:port or name)")
+@click.option("--room", default=None, help="Relay room code (cross-NAT)")
+@click.option("--endpoint", "-e", default=None, help="Relay server URL (with --room)")
+@click.option("--into", "profile", default=None, help="Profile to log the new account into")
+@click.option("--email", default=None, help="Pre-fill the email on the login page")
+@click.option("--console", "use_console", is_flag=True, help="Console (API) login instead of subscription")
+def auth_login_tunnel(ref, room, endpoint, profile, email, use_console) -> None:
+    """Run `claude auth login` HERE, but do the browser consent on another machine.
+
+    This machine (A) runs the login; the peer (B, running `auth login-helper`)
+    opens the consent URL, you approve there and paste the code back — it is fed
+    to claude here, so the account lands on THIS machine.
+    """
+    import asyncio
+    from claudex.core.device import load_device
+    from claudex.core.peer import PeerError, PeerStore
+    from claudex.core import login_tunnel as lt
+    if not ref and not room:
+        console.print("[red]specify --peer <host:port|name> or --room <code>[/red]")
+        raise SystemExit(1)
+    config_dir = None
+    if profile:
+        try:
+            config_dir = str(_pm().get(profile).config_dir)
+        except ClaudexError as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1)
+    dev, store = load_device(), PeerStore()
+
+    async def run():
+        try:
+            if room:
+                from claudex.core.sharing_client import SharingCredentials
+                ep = _resolve_endpoint(endpoint)
+                token = SharingCredentials(ep).load_jwt()
+                if not token:
+                    console.print(f"[red]not logged in to {ep} — run: claudex share auth[/red]")
+                    raise SystemExit(1)
+                ch = await lt.client_channel_relay(ep, room, token, dev, store)
+            else:
+                host, port, did, pub = _resolve_peer(ref)
+                ch = await lt.client_channel_lan(host, port, dev, store, did, pub)
+        except ClaudexError as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1)
+        except (PeerError, OSError) as e:
+            console.print(f"[red]cannot reach the helper: {e}[/red]")
+            raise SystemExit(1)
+        ok = await lt.run_initiator(ch, email=email, console=use_console,
+                                    config_dir=config_dir,
+                                    on_status=lambda m: console.print(f"[cyan]{m}[/cyan]"))
+        if ok:
+            console.print("[green]✓[/green] logged in"
+                          + (f" into profile [bold]{profile}[/bold]" if profile else ""))
+        else:
+            console.print("[red]login did not complete[/red]")
+            raise SystemExit(1)
+
+    asyncio.run(run())
+
+
+@auth_group.command("login-helper")
+@click.option("--room", default=None, help="Relay room code (cross-NAT)")
+@click.option("--endpoint", "-e", default=None, help="Relay server URL (with --room)")
+@click.option("--port", type=int, default=0, help="LAN port to listen on (0 = auto)")
+def auth_login_helper(room, endpoint, port) -> None:
+    """Do the browser consent for another machine's `auth login-tunnel`.
+
+    Opens the consent URL it sends, you approve and paste the code here; the code
+    is relayed back so the account lands on THAT machine.
+    """
+    import asyncio
+    import webbrowser
+    from claudex.core.device import load_device
+    from claudex.core.peer import PeerStore
+    from claudex.core import login_tunnel as lt
+    dev, store = load_device(), PeerStore()
+
+    def open_url(url: str) -> None:
+        console.print(f"[dim]consent URL (opening browser):[/dim]\n{url}")
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def get_code(url: str) -> str:
+        return click.prompt("paste the code from the page").strip()
+
+    async def helper(ch):
+        await lt.run_helper(ch, open_url=open_url, get_code=get_code,
+                            on_status=lambda m: console.print(f"[cyan]{m}[/cyan]"))
+
+    async def run():
+        if room:
+            from claudex.core.sharing_client import SharingCredentials
+            try:
+                ep = _resolve_endpoint(endpoint)
+            except ClaudexError as e:
+                console.print(f"[red]{e}[/red]")
+                raise SystemExit(1)
+            token = SharingCredentials(ep).load_jwt()
+            if not token:
+                console.print(f"[red]not logged in to {ep} — run: claudex share auth[/red]")
+                raise SystemExit(1)
+            console.print(f"[green]✓[/green] waiting in relay room [bold]{room}[/bold] "
+                          f"for a login from another machine…")
+            await lt.serve_helper_relay(ep, room, token, dev, store, helper)
+        else:
+            def on_ready(p):
+                console.print(f"[green]✓[/green] login helper on port [bold]{p}[/bold] "
+                              f"(device {dev.device_id}) — waiting for a login…")
+            await lt.serve_helper_lan(dev, store, helper, port=port, on_ready=on_ready)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped.[/dim]")
+
+
 def _pending_drop_path(name: str) -> Path:
     import claudex.constants as _C
     return _C.CLAUDEX_HOME / ".drops" / f"pending-{name}.json"
