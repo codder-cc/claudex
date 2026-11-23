@@ -2369,6 +2369,149 @@ def fleet_sessions() -> None:
     console.print(table)
 
 
+@fleet_group.group("remote")
+def fleet_remote_group() -> None:
+    """Hand prompts to another machine's fleet through a relay server."""
+
+
+def _remote(endpoint):
+    from claudex.fleet.remote import RemoteFleet
+    ep = _resolve_endpoint(endpoint)
+    return RemoteFleet.connect(ep), ep
+
+
+@fleet_remote_group.command("whoami")
+def fleet_remote_whoami() -> None:
+    """Show this machine's device identity (its public key is how peers find it)."""
+    from claudex.core.device import load_device
+    d = load_device()
+    console.print(f"[bold]{d.name}[/bold]  device [bold]{d.device_id}[/bold]")
+    console.print(f"[dim]pubkey {d.public_key}[/dim]")
+
+
+@fleet_remote_group.command("serve")
+@click.option("--target", "-t", required=True, help="Name other machines address this fleet by")
+@click.option("--profile", "-p", default=None, help="Profile to run remote prompts as")
+@click.option("--model", "-m", default=None, help="Model for remote prompts")
+@click.option("--endpoint", "-e", default=None, help="Relay server URL (overrides config)")
+@click.option("--interval", type=float, default=3.0, help="Poll interval seconds")
+def fleet_remote_serve(target, profile, model, endpoint, interval) -> None:
+    """Host: register this fleet and run prompts other machines submit to <target>."""
+    from claudex.fleet.remote import fleet_runner
+    try:
+        rf, ep = _remote(endpoint)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] serving fleet as [bold]{target}[/bold] "
+                  f"→ [dim]{ep}[/dim] (device {rf.device.device_id})")
+    console.print("[dim]waiting for remote prompts… Ctrl-C to stop[/dim]")
+
+    def on_job(prompt, text):
+        console.print(f"[cyan]◂ ran[/cyan] {prompt[:60]}"
+                      + ("…" if len(prompt) > 60 else ""))
+
+    try:
+        rf.serve_forever(target, fleet_runner(profile, model), interval=interval, on_job=on_job)
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped.[/dim]")
+
+
+@fleet_remote_group.command("submit")
+@click.argument("prompt")
+@click.option("--target", "-t", required=True, help="Which remote fleet to run on")
+@click.option("--endpoint", "-e", default=None, help="Relay server URL (overrides config)")
+@click.option("--label", default=None, help="Optional label")
+@click.option("--ttl", "ttl_minutes", type=int, default=None, help="Expiry in minutes")
+@click.option("--wait", is_flag=True, help="Block and print the result when it comes back")
+def fleet_remote_submit(prompt, target, endpoint, label, ttl_minutes, wait) -> None:
+    """Submitter: seal a prompt and hand it to the <target> fleet."""
+    from claudex.fleet.remote import RemoteError
+    try:
+        rf, _ = _remote(endpoint)
+        job_id = rf.submit(target, prompt, label=label, ttl_minutes=ttl_minutes)
+    except (ClaudexError, RemoteError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] submitted to [bold]{target}[/bold] · job [bold]{job_id}[/bold]")
+    if wait:
+        with console.status("waiting for the remote fleet…"):
+            res = rf.poll_result(job_id)
+        if res.status == "done":
+            console.print(res.text)
+        else:
+            console.print(f"[red]{res.status}: {res.error}[/red]")
+            raise SystemExit(1)
+
+
+@fleet_remote_group.command("result")
+@click.argument("job_id")
+@click.option("--endpoint", "-e", default=None)
+@click.option("--wait", is_flag=True, help="Block until the job finishes")
+def fleet_remote_result(job_id, endpoint, wait) -> None:
+    """Fetch a remote job's result (its text is unsealed locally)."""
+    try:
+        rf, _ = _remote(endpoint)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    res = rf.poll_result(job_id, timeout=(1800 if wait else 0.1), interval=2.0)
+    if res.status == "done":
+        console.print(res.text)
+    elif res.status == "timeout" and not wait:
+        console.print("[yellow]not finished yet.[/yellow] Add --wait to block.")
+    else:
+        console.print(f"[red]{res.status}: {res.error}[/red]")
+
+
+@fleet_remote_group.command("hosts")
+@click.option("--endpoint", "-e", default=None)
+def fleet_remote_hosts(endpoint) -> None:
+    """List fleet hosts registered on the relay server."""
+    try:
+        rf, _ = _remote(endpoint)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    hosts = rf.hosts()
+    if not hosts:
+        console.print("[yellow]No hosts registered.[/yellow] Run `fleet remote serve` on a machine.")
+        return
+    table = Table(title="Remote fleet hosts", show_header=True, header_style="bold cyan")
+    table.add_column("Target", style="bold")
+    table.add_column("Device key")
+    table.add_column("Last seen")
+    for h in hosts:
+        table.add_row(h.get("target", "—"), (h.get("public_key") or "")[:16] + "…",
+                      h.get("last_seen") or "—")
+    console.print(table)
+
+
+@fleet_remote_group.command("jobs")
+@click.option("--endpoint", "-e", default=None)
+def fleet_remote_jobs(endpoint) -> None:
+    """List your remote jobs on the relay server."""
+    try:
+        rf, _ = _remote(endpoint)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    jobs = rf.jobs()
+    if not jobs:
+        console.print("[yellow]No remote jobs.[/yellow]")
+        return
+    table = Table(title="Remote jobs", show_header=True, header_style="bold cyan")
+    table.add_column("Job", style="bold")
+    table.add_column("Target")
+    table.add_column("Status")
+    table.add_column("Label")
+    for j in jobs:
+        table.add_row(j.get("job_id", "—")[:8], j.get("target", "—"),
+                      f"[{_status_style(j.get('status', ''))}]{j.get('status', '')}[/]",
+                      j.get("label") or "—")
+    console.print(table)
+
+
 @fleet_group.command("status")
 @click.argument("job_id", required=False)
 def fleet_status(job_id) -> None:

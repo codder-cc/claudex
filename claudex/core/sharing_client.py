@@ -201,6 +201,55 @@ class SharingClient:
         data = _http("GET", self._url("/api/v1/claudex/drops"), headers=self._auth_header)
         return data.get("drops", [])
 
+    # ── remote fleet jobs (see claudex.fleet.remote) ─────────────────────────
+    def register_fleet_host(self, target: str, public_key: str) -> dict:
+        return _http("PUT", self._url(f"/api/v1/claudex/fleet/hosts/{target}"),
+                     data={"public_key": public_key}, headers=self._auth_header)
+
+    def list_fleet_hosts(self) -> List[dict]:
+        data = _http("GET", self._url("/api/v1/claudex/fleet/hosts"), headers=self._auth_header)
+        return data.get("hosts", [])
+
+    def submit_fleet_job(self, target: str, submitter_pubkey: str, sealed_prompt_b64: str,
+                         label: Optional[str] = None, ttl_minutes: Optional[int] = None) -> dict:
+        payload = {"target": target, "submitter_pubkey": submitter_pubkey,
+                   "sealed_prompt": sealed_prompt_b64}
+        if label:
+            payload["label"] = label
+        if ttl_minutes:
+            payload["ttl_minutes"] = int(ttl_minutes)
+        return _http("POST", self._url("/api/v1/claudex/fleet/jobs"),
+                     data=payload, headers=self._auth_header)
+
+    def claim_fleet_job(self, target: str) -> Optional[dict]:
+        """One claimed job, or None (204) when the target has nothing pending."""
+        data = _http("POST", self._url("/api/v1/claudex/fleet/jobs/claim"),
+                     data={"target": target}, headers=self._auth_header)
+        return data or None
+
+    def complete_fleet_job(self, job_id: str, status: str,
+                           sealed_result_b64: Optional[str] = None,
+                           error: Optional[str] = None) -> dict:
+        payload = {"status": status}
+        if sealed_result_b64 is not None:
+            payload["sealed_result"] = sealed_result_b64
+        if error:
+            payload["error"] = error
+        return _http("POST", self._url(f"/api/v1/claudex/fleet/jobs/{job_id}/result"),
+                     data=payload, headers=self._auth_header)
+
+    def get_fleet_job(self, job_id: str) -> dict:
+        return _http("GET", self._url(f"/api/v1/claudex/fleet/jobs/{job_id}"),
+                     headers=self._auth_header)
+
+    def list_fleet_jobs(self) -> List[dict]:
+        data = _http("GET", self._url("/api/v1/claudex/fleet/jobs"), headers=self._auth_header)
+        return data.get("jobs", [])
+
+    def delete_fleet_job(self, job_id: str) -> None:
+        _http("DELETE", self._url(f"/api/v1/claudex/fleet/jobs/{job_id}"),
+              headers=self._auth_header)
+
 
 def fill_drop(endpoint: str, drop_id: str, write_token: str, ciphertext: bytes,
               backend: str = "claude") -> dict:
