@@ -47,22 +47,9 @@ class PeerServer:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peername = writer.get_extra_info("peername")
-        addr = f"{peername[0]}:{peername[1]}" if peername else ""
+    async def _run_session(self, ch) -> None:
+        """Serve one peer: bridge the channel to a live session until it ends."""
         session = None
-        try:
-            ch = await asyncio.wait_for(
-                handshake(reader, writer, self.device, self.store,
-                          initiator=False, addr=addr), timeout=15)
-        except Exception as e:  # noqa: BLE001
-            self._log(f"handshake failed from {addr}: {e}")
-            try:
-                writer.close()
-            except Exception:
-                pass
-            return
-        self._log(f"peer {ch.peer_name or ch.peer_device_id} connected from {addr}")
         try:
             while True:
                 req = await ch.recv()
@@ -97,6 +84,25 @@ class PeerServer:
                     await asyncio.to_thread(session.close)
                 except Exception:
                     pass
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peername = writer.get_extra_info("peername")
+        addr = f"{peername[0]}:{peername[1]}" if peername else ""
+        try:
+            ch = await asyncio.wait_for(
+                handshake(reader, writer, self.device, self.store,
+                          initiator=False, addr=addr), timeout=15)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"handshake failed from {addr}: {e}")
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return
+        self._log(f"peer {ch.peer_name or ch.peer_device_id} connected from {addr}")
+        try:
+            await self._run_session(ch)
+        finally:
             try:
                 writer.close()
             except Exception:
@@ -129,6 +135,28 @@ class PeerServer:
         if self._server:
             self._server.close()
 
+    async def serve_relay(self, endpoint: str, room: str, token: str,
+                          should_stop=None) -> None:
+        """Host over a relay server: wait in <room> for a joiner, serve one
+        session, then reconnect for the next. Works across NAT (no LAN needed)."""
+        while not (should_stop and should_stop()):
+            try:
+                ws = await _relay_ws(endpoint, room, token)
+            except Exception as e:  # noqa: BLE001
+                self._log(f"relay connect failed: {e}")
+                await asyncio.sleep(3)
+                continue
+            stream = WSStream(ws)
+            try:
+                ch = await handshake(stream, stream, self.device, self.store,
+                                     initiator=False, addr=f"relay:{room}")
+                self._log(f"peer {ch.peer_name or ch.peer_device_id} connected via relay")
+                await self._run_session(ch)
+            except Exception as e:  # noqa: BLE001
+                self._log(f"relay session ended: {e}")
+            finally:
+                await stream.wait_closed()
+
 
 def _spawn_proc(argv, env, cwd):
     import subprocess
@@ -151,6 +179,19 @@ class PeerClient:
                              expect_pubkey=expect_pubkey, addr=f"{host}:{port}")
         return cls(ch)
 
+    @classmethod
+    async def connect_relay(cls, endpoint: str, room: str, token: str,
+                            device: DeviceIdentity, store: PeerStore,
+                            expect_device_id: Optional[str] = None,
+                            expect_pubkey: Optional[str] = None) -> "PeerClient":
+        """Join <room> on a relay server and handshake with the host there."""
+        ws = await _relay_ws(endpoint, room, token)
+        stream = WSStream(ws)
+        ch = await handshake(stream, stream, device, store, initiator=True,
+                             expect_device_id=expect_device_id,
+                             expect_pubkey=expect_pubkey, addr=f"relay:{room}")
+        return cls(ch)
+
     @property
     def peer(self) -> str:
         return self._ch.peer_name or self._ch.peer_device_id
@@ -170,6 +211,81 @@ class PeerClient:
         except Exception:  # noqa: BLE001
             pass
         await self._ch.close()
+
+
+# ── relay transport (WebSocket through a server) ──────────────────────────────
+def _relay_url(endpoint: str, room: str) -> str:
+    e = endpoint.rstrip("/")
+    if e.startswith("https://"):
+        base = "wss://" + e[len("https://"):]
+    elif e.startswith("http://"):
+        base = "ws://" + e[len("http://"):]
+    else:
+        base = e
+    return f"{base}/ws/claudex/relay/{room}"
+
+
+def _origin(endpoint: str) -> str:
+    e = endpoint.rstrip("/")
+    # scheme://host[:port] — the server's own origin, which its CORS allows
+    for sep in ("://",):
+        if sep in e:
+            scheme, rest = e.split(sep, 1)
+            return f"{scheme}://{rest.split('/', 1)[0]}"
+    return e
+
+
+async def _relay_ws(endpoint: str, room: str, token: str):
+    import websockets
+    url = _relay_url(endpoint, room) + f"?token={token}"
+    # quart_cors rejects a WebSocket with no Origin; send the server's own origin
+    # (an allowed one — codder.cc in prod, or a third-party relay's own host).
+    return await websockets.connect(url, max_size=None, ping_interval=20,
+                                    ping_timeout=20, origin=_origin(endpoint))
+
+
+class WSStream:
+    """Adapts a websockets connection to the reader/writer surface SecureChannel
+    expects (readexactly / write+drain / close+wait_closed), so the peer channel
+    runs unchanged over a relayed WebSocket. One write+drain == one WS message;
+    readexactly reassembles across messages via an internal buffer."""
+
+    def __init__(self, ws):
+        self._ws = ws
+        self._buf = b""
+        self._pending = b""
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            try:
+                msg = await self._ws.recv()
+            except Exception:  # noqa: BLE001 — connection closed
+                raise asyncio.IncompleteReadError(self._buf, n)
+            if msg is None:
+                raise asyncio.IncompleteReadError(self._buf, n)
+            self._buf += msg if isinstance(msg, (bytes, bytearray)) else str(msg).encode()
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def write(self, data: bytes) -> None:
+        self._pending += data
+
+    async def drain(self) -> None:
+        if self._pending:
+            data, self._pending = self._pending, b""
+            await self._ws.send(data)
+
+    def close(self) -> None:
+        asyncio.ensure_future(self._ws.close())
+
+    async def wait_closed(self) -> None:
+        try:
+            await self._ws.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def get_extra_info(self, key, default=None):
+        return default
 
 
 # ── mDNS discovery (optional) ─────────────────────────────────────────────────

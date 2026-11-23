@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claudex"
-version = "0.13.0"
+version = "0.14.0"
 description = "Cross-platform profile manager and session switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,7 +35,7 @@ dependencies = [
 [project.optional-dependencies]
 fuzzy = ["rapidfuzz>=3.0"]
 fleet = ["mcp>=1.2"]
-peer = ["zeroconf>=0.130"]
+peer = ["zeroconf>=0.130", "websockets>=12"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",

@@ -2777,10 +2777,12 @@ def peer_ls(timeout) -> None:
 @peer_group.command("serve")
 @click.option("--profile", "-p", required=True, help="Profile remote peers run as")
 @click.option("--model", "-m", default=None, help="Model for remote sessions")
-@click.option("--port", type=int, default=0, help="Port to listen on (0 = auto)")
+@click.option("--port", type=int, default=0, help="LAN port to listen on (0 = auto)")
 @click.option("--cwd", default=None, help="Working directory for sessions")
-def peer_serve(profile, model, port, cwd) -> None:
-    """Host: advertise on the LAN and run peers' prompts in a live session here."""
+@click.option("--room", default=None, help="Serve via a relay room instead of the LAN (cross-NAT)")
+@click.option("--endpoint", "-e", default=None, help="Relay server URL (with --room)")
+def peer_serve(profile, model, port, cwd, room, endpoint) -> None:
+    """Host: run peers' prompts in a live session here (LAN by default, or --room via a relay)."""
     import asyncio
     from claudex.core.device import load_device
     from claudex.core.peer import PeerStore
@@ -2793,6 +2795,30 @@ def peer_serve(profile, model, port, cwd) -> None:
     dev = load_device()
     srv = PeerServer(dev, PeerStore(), profile, model=model, port=port, cwd=cwd,
                      on_event=lambda m: console.print(f"[dim]{m}[/dim]"))
+
+    if room:
+        from claudex.core.sharing_client import SharingCredentials
+        try:
+            ep = _resolve_endpoint(endpoint)
+        except ClaudexError as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1)
+        token = SharingCredentials(ep).load_jwt()
+        if not token:
+            console.print(f"[red]not logged in to {ep} — run: claudex share auth[/red]")
+            raise SystemExit(1)
+
+        async def run_relay():
+            console.print(f"[green]✓[/green] serving as [bold]{dev.name}[/bold] "
+                          f"via relay room [bold]{room}[/bold] → [dim]{ep}[/dim] · profile [bold]{profile}[/bold]")
+            console.print("[dim]waiting for a peer to join the room · Ctrl-C to stop[/dim]")
+            await srv.serve_relay(ep, room, token)
+
+        try:
+            asyncio.run(run_relay())
+        except KeyboardInterrupt:
+            console.print("\n[dim]stopped.[/dim]")
+        return
 
     async def run():
         p = await srv.start()
@@ -2807,27 +2833,44 @@ def peer_serve(profile, model, port, cwd) -> None:
         console.print("\n[dim]stopped.[/dim]")
 
 
+async def _peer_connect(ref, room, endpoint):
+    """Connect to a peer by LAN ref or by relay room. Returns a PeerClient."""
+    from claudex.core.device import load_device
+    from claudex.core.peer import PeerStore
+    from claudex.fleet.peer_stream import PeerClient
+    if room:
+        from claudex.core.sharing_client import SharingCredentials
+        ep = _resolve_endpoint(endpoint)
+        token = SharingCredentials(ep).load_jwt()
+        if not token:
+            raise ClaudexError(f"not logged in to {ep} — run: claudex share auth")
+        return await PeerClient.connect_relay(ep, room, token, load_device(), PeerStore())
+    host, port, did, pub = _resolve_peer(ref)
+    return await PeerClient.connect(host, port, load_device(), PeerStore(),
+                                    expect_device_id=did, expect_pubkey=pub)
+
+
 @peer_group.command("ask")
-@click.argument("ref")
+@click.argument("ref", required=False)
 @click.argument("prompt")
 @click.option("--model", "-m", default=None)
 @click.option("--timeout", type=float, default=600)
-def peer_ask(ref, prompt, model, timeout) -> None:
-    """Send one prompt to a peer's session and print the reply."""
+@click.option("--room", default=None, help="Connect via a relay room instead of the LAN")
+@click.option("--endpoint", "-e", default=None)
+def peer_ask(ref, prompt, model, timeout, room, endpoint) -> None:
+    """Send one prompt to a peer's session and print the reply.
+
+    REF is a LAN host:port or peer name; or use --room for a relay peer.
+    """
     import asyncio
-    from claudex.core.device import load_device
-    from claudex.core.peer import PeerError, PeerStore
-    from claudex.fleet.peer_stream import PeerClient
-    try:
-        host, port, did, pub = _resolve_peer(ref)
-    except ClaudexError as e:
-        console.print(f"[red]{e}[/red]")
-        raise SystemExit(1)
+    from claudex.core.peer import PeerError
 
     async def run():
         try:
-            pc = await PeerClient.connect(host, port, load_device(), PeerStore(),
-                                          expect_device_id=did, expect_pubkey=pub)
+            pc = await _peer_connect(ref, room, endpoint)
+        except ClaudexError as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1)
         except (PeerError, OSError) as e:
             console.print(f"[red]cannot connect: {e}[/red]")
             raise SystemExit(1)
@@ -2844,25 +2887,22 @@ def peer_ask(ref, prompt, model, timeout) -> None:
 
 
 @peer_group.command("stream")
-@click.argument("ref")
+@click.argument("ref", required=False)
 @click.option("--model", "-m", default=None)
 @click.option("--timeout", type=float, default=600)
-def peer_stream_cmd(ref, model, timeout) -> None:
-    """Open a live REPL into a peer's session (stream prompts into it)."""
+@click.option("--room", default=None, help="Connect via a relay room instead of the LAN")
+@click.option("--endpoint", "-e", default=None)
+def peer_stream_cmd(ref, model, timeout, room, endpoint) -> None:
+    """Open a live REPL into a peer's session (LAN REF or --room via a relay)."""
     import asyncio
-    from claudex.core.device import load_device
-    from claudex.core.peer import PeerError, PeerStore
-    from claudex.fleet.peer_stream import PeerClient
-    try:
-        host, port, did, pub = _resolve_peer(ref)
-    except ClaudexError as e:
-        console.print(f"[red]{e}[/red]")
-        raise SystemExit(1)
+    from claudex.core.peer import PeerError
 
     async def run():
         try:
-            pc = await PeerClient.connect(host, port, load_device(), PeerStore(),
-                                          expect_device_id=did, expect_pubkey=pub)
+            pc = await _peer_connect(ref, room, endpoint)
+        except ClaudexError as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1)
         except (PeerError, OSError) as e:
             console.print(f"[red]cannot connect: {e}[/red]")
             raise SystemExit(1)
