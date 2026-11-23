@@ -2707,5 +2707,198 @@ def fleet_run_worker(job_id) -> None:
     sys.exit(run_worker(job_id))
 
 
+# ── peer links: stream into another machine's session over the LAN ───────────--
+@cli.group("peer")
+def peer_group() -> None:
+    """Talk to other claudex/aimux machines on your network (LAN peer links)."""
+
+
+def _resolve_peer(ref: str):
+    """(host, port, expect_device_id, expect_pubkey) from a host:port or a name/id."""
+    from claudex.core.peer import PeerStore
+    from claudex.fleet import peer_stream
+    if ":" in ref and ref.rsplit(":", 1)[1].isdigit():
+        host, port = ref.rsplit(":", 1)
+        return host, int(port), None, None
+    # a device id or name — look on the LAN, then in the pinned store
+    for p in peer_stream.discover(timeout=2.0):
+        if ref in (p.get("device_id"), p.get("name")) and p.get("addr") and p.get("port"):
+            return p["addr"], int(p["port"]), p.get("device_id"), p.get("pubkey")
+    entry = PeerStore().get(ref)
+    if entry and entry.get("addr"):
+        a = entry["addr"]
+        if ":" in a and a.rsplit(":", 1)[1].isdigit():
+            host, port = a.rsplit(":", 1)
+            return host, int(port), ref, entry.get("public_key")
+    raise ClaudexError(f"peer '{ref}' not found on the LAN or in known peers — "
+                       f"use host:port, or run `peer ls`")
+
+
+@peer_group.command("whoami")
+def peer_whoami() -> None:
+    """Show this machine's device identity."""
+    from claudex.core.device import load_device
+    d = load_device()
+    console.print(f"[bold]{d.name}[/bold]  device [bold]{d.device_id}[/bold]")
+    console.print(f"[dim]pubkey {d.public_key}[/dim]")
+
+
+@peer_group.command("ls")
+@click.option("--timeout", type=float, default=2.0, help="Discovery seconds")
+def peer_ls(timeout) -> None:
+    """Discover claudex/aimux peers advertised on the LAN (mDNS)."""
+    from claudex.core.peer import PeerStore
+    from claudex.fleet import peer_stream
+    found = peer_stream.discover(timeout=timeout)
+    pinned = {p["device_id"]: p for p in PeerStore().list()}
+    if not found and not pinned:
+        console.print("[yellow]No peers found.[/yellow] Run `peer serve` on another machine "
+                      "(and `pip install claudex[peer]` for mDNS).")
+        return
+    table = Table(title="Peers", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Device")
+    table.add_column("Address")
+    table.add_column("Trust")
+    seen = set()
+    for p in found:
+        did = p.get("device_id") or "—"
+        seen.add(did)
+        known = did in pinned
+        table.add_row(p.get("name") or "—", did,
+                      f"{p.get('addr')}:{p.get('port')}" if p.get("addr") else "—",
+                      "[green]pinned[/green]" if known else "[yellow]new[/yellow]")
+    for did, p in pinned.items():
+        if did not in seen:
+            table.add_row(p.get("name") or "—", did, p.get("addr") or "—", "[dim]offline[/dim]")
+    console.print(table)
+
+
+@peer_group.command("serve")
+@click.option("--profile", "-p", required=True, help="Profile remote peers run as")
+@click.option("--model", "-m", default=None, help="Model for remote sessions")
+@click.option("--port", type=int, default=0, help="Port to listen on (0 = auto)")
+@click.option("--cwd", default=None, help="Working directory for sessions")
+def peer_serve(profile, model, port, cwd) -> None:
+    """Host: advertise on the LAN and run peers' prompts in a live session here."""
+    import asyncio
+    from claudex.core.device import load_device
+    from claudex.core.peer import PeerStore
+    from claudex.fleet.peer_stream import PeerServer
+    try:
+        _pm().get(profile)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    dev = load_device()
+    srv = PeerServer(dev, PeerStore(), profile, model=model, port=port, cwd=cwd,
+                     on_event=lambda m: console.print(f"[dim]{m}[/dim]"))
+
+    async def run():
+        p = await srv.start()
+        console.print(f"[green]✓[/green] serving as [bold]{dev.name}[/bold] "
+                      f"(device {dev.device_id}) on port [bold]{p}[/bold] → profile [bold]{profile}[/bold]")
+        console.print("[dim]advertised on the LAN · Ctrl-C to stop[/dim]")
+        await srv.serve_forever()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped.[/dim]")
+
+
+@peer_group.command("ask")
+@click.argument("ref")
+@click.argument("prompt")
+@click.option("--model", "-m", default=None)
+@click.option("--timeout", type=float, default=600)
+def peer_ask(ref, prompt, model, timeout) -> None:
+    """Send one prompt to a peer's session and print the reply."""
+    import asyncio
+    from claudex.core.device import load_device
+    from claudex.core.peer import PeerError, PeerStore
+    from claudex.fleet.peer_stream import PeerClient
+    try:
+        host, port, did, pub = _resolve_peer(ref)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    async def run():
+        try:
+            pc = await PeerClient.connect(host, port, load_device(), PeerStore(),
+                                          expect_device_id=did, expect_pubkey=pub)
+        except (PeerError, OSError) as e:
+            console.print(f"[red]cannot connect: {e}[/red]")
+            raise SystemExit(1)
+        try:
+            resp = await pc.ask(prompt, timeout=timeout)
+            if resp.get("ok") and not resp.get("is_error"):
+                console.print(resp.get("text", ""))
+            else:
+                console.print(f"[red]{resp.get('error') or resp.get('text') or 'error'}[/red]")
+        finally:
+            await pc.close()
+
+    asyncio.run(run())
+
+
+@peer_group.command("stream")
+@click.argument("ref")
+@click.option("--model", "-m", default=None)
+@click.option("--timeout", type=float, default=600)
+def peer_stream_cmd(ref, model, timeout) -> None:
+    """Open a live REPL into a peer's session (stream prompts into it)."""
+    import asyncio
+    from claudex.core.device import load_device
+    from claudex.core.peer import PeerError, PeerStore
+    from claudex.fleet.peer_stream import PeerClient
+    try:
+        host, port, did, pub = _resolve_peer(ref)
+    except ClaudexError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    async def run():
+        try:
+            pc = await PeerClient.connect(host, port, load_device(), PeerStore(),
+                                          expect_device_id=did, expect_pubkey=pub)
+        except (PeerError, OSError) as e:
+            console.print(f"[red]cannot connect: {e}[/red]")
+            raise SystemExit(1)
+        console.print(f"[green]✓[/green] streaming into [bold]{pc.peer}[/bold] · /exit to quit")
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                line = await loop.run_in_executor(None, lambda: input("› "))
+                if line.strip() in ("/exit", "/quit", "/q"):
+                    break
+                if not line.strip():
+                    continue
+                resp = await pc.ask(line, timeout=timeout)
+                if resp.get("ok") and not resp.get("is_error"):
+                    console.print(resp.get("text", ""))
+                else:
+                    console.print(f"[red]{resp.get('error') or resp.get('text') or 'error'}[/red]")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            await pc.close()
+            console.print("[dim]disconnected.[/dim]")
+
+    asyncio.run(run())
+
+
+@peer_group.command("forget")
+@click.argument("device_id")
+def peer_forget(device_id) -> None:
+    """Un-pin a peer's device key (it will be re-pinned on next connect)."""
+    from claudex.core.peer import PeerStore
+    if PeerStore().forget(device_id):
+        console.print(f"[green]✓[/green] forgot {device_id}")
+    else:
+        console.print(f"[yellow]no pinned peer {device_id}[/yellow]")
+
+
 if __name__ == "__main__":
     cli()
