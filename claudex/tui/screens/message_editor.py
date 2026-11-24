@@ -39,6 +39,7 @@ _KIND_STYLE = {
     "tool_result": "cyan",
     "command": "bright_black",
     "meta": "bright_black",
+    "error": "red",
 }
 
 

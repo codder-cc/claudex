@@ -393,6 +393,12 @@ class MsgView:
 
 
 def _entry_kind(obj: dict) -> str:
+    # Synthetic API-error / refusal messages ("API Error: …'s safeguards flagged
+    # this message…") are written as assistant turns but aren't real content.
+    # Claude Code flags them, so we classify them separately and hide them from
+    # the default (turns) view.
+    if obj.get("isApiErrorMessage") or obj.get("message", {}).get("model") == "<synthetic>":
+        return "error"
     if obj.get("isMeta"):
         return "meta"
     if _is_command_plumbing(obj):
@@ -454,7 +460,7 @@ def _set_entry_text(obj: dict, new_text: str) -> bool:
     return False
 
 
-_TURN_HIDDEN = ("thinking", "tool_use", "tool_result", "command", "meta")
+_TURN_HIDDEN = ("thinking", "tool_use", "tool_result", "command", "meta", "error")
 
 
 def list_messages(path: Path, *, include_inactive: bool = False,

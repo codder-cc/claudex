@@ -266,3 +266,25 @@ def test_branch_only_active_chain_trimmed(tmp_path):
     uuids = {json.loads(l)["uuid"] for l in f.read_text().splitlines() if l.strip()}
     assert "u2" not in uuids and "a2" not in uuids       # trimmed
     assert {"u1", "a1", "dead", "deadA"} <= uuids         # dead branch untouched
+
+
+def test_api_error_messages_are_hidden_from_turns(tmp_path):
+    """Synthetic 'API Error: …safeguards flagged…' assistant messages are
+    classified as kind 'error' and hidden from the default turns view."""
+    f = tmp_path / "err.jsonl"
+    rows = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "uuid": "e1", "parentUuid": "u1",
+         "isApiErrorMessage": True, "error": "invalid_request",
+         "message": {"role": "assistant", "model": "<synthetic>", "stop_reason": "refusal",
+                     "content": [{"type": "text",
+                                  "text": "API Error: Opus's safeguards flagged this message."}]}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "e1",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "real reply"}]}},
+    ]
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    all_msgs = edit.list_messages(f)
+    assert next(m for m in all_msgs if m.uuid == "e1").kind == "error"
+    turns = edit.list_messages(f, turns=True)
+    assert [m.uuid for m in turns] == ["u1", "a1"]   # the error turn is hidden
