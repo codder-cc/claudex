@@ -17,10 +17,12 @@ conversation in memory); the edit takes effect when the session is next
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import List, Optional
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -46,6 +48,7 @@ class MessageEditorScreen(Screen):
         Binding("e", "edit_msg", "Edit text", show=True),
         Binding("x", "delete_msg", "Delete", show=True),
         Binding("t", "trim_here", "Trim to here", show=True),
+        Binding("a", "toggle_all", "All / turns", show=True),
         Binding("f", "toggle_follow", "Follow", show=True),
         Binding("r", "reload", "Reload", show=True),
         Binding("j", "cursor_down", "Down", show=False),
@@ -57,6 +60,8 @@ class MessageEditorScreen(Screen):
         self._session = session
         self._path: Path = session.file_path
         self._msgs: List[edit.MsgView] = []
+        self._mode = "turns"      # "turns" (real conversation) | "all" (every entry)
+        self._loading = False
         self._follow = False
         self._offset = 0
         self._timer = None
@@ -70,24 +75,36 @@ class MessageEditorScreen(Screen):
                 with VerticalScroll(id="msg-content"):
                     yield Static("", id="msg-content-body")
             yield Static(
-                "[dim]e edit · x delete · t trim-to-here · f follow · r reload · esc back[/dim]",
+                "[dim]e edit · x delete · t trim-to-here · a all/turns · "
+                "f follow · r reload · esc back[/dim]",
                 id="editor-hints",
             )
 
     def on_mount(self) -> None:
-        self._reload()
         try:
             self._offset = self._path.stat().st_size
         except OSError:
             self._offset = 0
+        self._reload()
 
-    # ── data ───────────────────────────────────────────────────────────────────
+    # ── data (loaded off the UI thread — transcripts can be hundreds of MB) ─────
     def _reload(self) -> None:
+        self._load_worker()
+
+    @work(exclusive=True)
+    async def _load_worker(self) -> None:
+        self._loading = True
+        self._update_header()
         try:
-            self._msgs = edit.list_messages(self._path)
+            self._msgs = await asyncio.to_thread(
+                edit.list_messages, self._path, turns=(self._mode == "turns"))
         except OSError as e:
-            self.notify(f"Can't read transcript: {e}", severity="error")
             self._msgs = []
+            self.notify(f"Can't read transcript: {e}", severity="error")
+        self._loading = False
+        self._populate()
+
+    def _populate(self) -> None:
         lv = self.query_one("#msg-list", ListView)
         idx = lv.index or 0
         lv.clear()
@@ -104,11 +121,17 @@ class MessageEditorScreen(Screen):
         self._show_selected()
 
     def _update_header(self) -> None:
-        live = "  [b green]● LIVE — edits apply on next resume[/]" if self._follow else ""
+        if self._loading:
+            state = "  [yellow]⏳ loading…[/]"
+        elif self._follow:
+            state = "  [b green]● LIVE — edits apply on next resume[/]"
+        else:
+            state = ""
+        mode = "turns" if self._mode == "turns" else "all"
         self.query_one("#editor-header", Static).update(
             f"[b]{self._session.title[:60]}[/b]  "
-            f"[dim]{self._session.profile_name} · {len(self._msgs)} messages · "
-            f"{self._session.session_id[:12]}…[/dim]{live}"
+            f"[dim]{self._session.profile_name} · {len(self._msgs)} {mode} · "
+            f"{self._session.session_id[:12]}…[/dim]{state}"
         )
 
     def _selected(self) -> Optional[edit.MsgView]:
@@ -142,7 +165,12 @@ class MessageEditorScreen(Screen):
 
     def action_reload(self) -> None:
         self._reload()
-        self.notify("Reloaded from disk.")
+
+    def action_toggle_all(self) -> None:
+        self._mode = "all" if self._mode == "turns" else "turns"
+        self._reload()
+        self.notify("Showing every entry." if self._mode == "all"
+                    else "Showing the conversation (turns).")
 
     # ── edits ───────────────────────────────────────────────────────────────────
     def action_edit_msg(self) -> None:

@@ -159,9 +159,20 @@ def parse_session_file(path: Path, profile_name: str) -> Optional[Session]:
                     last_active = ts
 
                 if role in ("user", "human") and not found_first_user:
-                    found_first_user = True
+                    # Skip harness noise so the title is the first thing the human
+                    # actually typed — not a tool result, a meta "Caveat:" line, or
+                    # slash-command plumbing (<command-name>, <local-command-*>).
                     title_text = _extract_text(content).strip()
-                    title = title_text[:80] if title_text else "(untitled)"
+                    is_tool_result = (
+                        isinstance(content, list)
+                        and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                for b in content)
+                    )
+                    if (not obj.get("isMeta") and not is_tool_result
+                            and title_text
+                            and not title_text.startswith(("<command-", "<local-command-"))):
+                        found_first_user = True
+                        title = title_text[:80]
 
                 if role in ("assistant", "ai"):
                     usage = _parse_usage(obj if "usage" in obj else msg)

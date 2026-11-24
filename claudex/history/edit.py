@@ -134,30 +134,101 @@ def _load(path: Path) -> List[_Entry]:
 
 
 def _active_chain(entries: List[_Entry]) -> List[dict]:
-    """The resumable chain, root→leaf, following ``parentUuid`` from the leaf.
+    """The resumable chain of **messages**, root→leaf, following ``parentUuid``.
 
     The leaf is the last non-sidechain message line in file order (what Claude
-    resumes from). Dead branches and subagent sidechains are left out of the
-    chain so trimming never touches them.
+    resumes from). Crucially, a real transcript's ``parentUuid`` links thread
+    *through* non-message entries (``system``, summary / compact boundaries), so
+    the walk must index every uuid — not only user/assistant — or it stops at the
+    first non-message ancestor and returns a stub of 1–2 orphan messages. We walk
+    the full uuid graph but collect only the message entries on the path.
     """
-    by_uuid: dict = {}
+    parent_of: dict = {}          # every uuid → its parentUuid
+    by_uuid: dict = {}            # message uuid → obj
     leaf: Optional[str] = None
     for e in entries:
-        if e.obj is None or e.type not in _MSG_TYPES:
+        if e.obj is None:
             continue
         u = e.uuid
         if not u:
             continue
-        by_uuid[u] = e.obj
-        if not e.obj.get("isSidechain"):
-            leaf = u
+        parent_of[u] = e.obj.get("parentUuid")
+        if e.type in _MSG_TYPES:
+            by_uuid[u] = e.obj
+            if not e.obj.get("isSidechain"):
+                leaf = u
     chain: List[dict] = []
     seen: set = set()
     cur = leaf
-    while cur and cur in by_uuid and cur not in seen:
+    while cur and cur not in seen and cur in parent_of:
         seen.add(cur)
-        chain.append(by_uuid[cur])
-        cur = by_uuid[cur].get("parentUuid")
+        if cur in by_uuid:
+            chain.append(by_uuid[cur])
+        cur = parent_of[cur]
+    chain.reverse()
+    return chain
+
+
+# ── fast streaming scan (one pass, no raw retention) ──────────────────────────
+@dataclass
+class _Scan:
+    """Lightweight index of a transcript, built in a single streaming pass.
+
+    Keeps only small per-uuid facts — never the raw lines — so it stays cheap on
+    the multi-hundred-MB transcripts Claude Code produces, where loading every
+    line into memory (and doing it twice) is what made the editor crawl.
+    """
+    parent_of: dict      # every uuid → its parentUuid (threads through non-messages)
+    role: dict           # message uuid → "user" | "assistant"
+    kind: dict           # message uuid → text|thinking|tool_use|tool_result|command|meta
+    text: dict           # message uuid → full text (or a label for non-text kinds)
+    turn: set            # message uuids that are genuine human turns
+    sidechain: set       # message uuids on subagent sidechains
+    leaf: Optional[str]  # last non-sidechain message in file order
+    order: List[str]     # message uuids in file order
+
+
+def _scan(path: Path) -> _Scan:
+    s = _Scan(parent_of={}, role={}, kind={}, text={}, turn=set(),
+              sidechain=set(), leaf=None, order=[])
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            u = obj.get("uuid")
+            if not u:
+                continue
+            s.parent_of[u] = obj.get("parentUuid")
+            if obj.get("type") in _MSG_TYPES:
+                s.role[u] = obj["type"]
+                s.kind[u] = _entry_kind(obj)
+                s.text[u] = _entry_full_text(obj)
+                if is_user_turn(obj):
+                    s.turn.add(u)
+                if obj.get("isSidechain"):
+                    s.sidechain.add(u)
+                else:
+                    s.leaf = u
+                s.order.append(u)
+    return s
+
+
+def _chain_uuids(scan: _Scan) -> List[str]:
+    """Message uuids on the active chain, root→leaf (walks through non-messages)."""
+    chain: List[str] = []
+    seen: set = set()
+    cur = scan.leaf
+    while cur and cur not in seen and cur in scan.parent_of:
+        seen.add(cur)
+        if cur in scan.role and cur not in scan.sidechain:
+            chain.append(cur)
+        cur = scan.parent_of[cur]
     chain.reverse()
     return chain
 
@@ -173,30 +244,31 @@ class Round:
     line_count: int
 
 
-def list_rounds(path: Path) -> List[Round]:
-    """Split a transcript's active chain into conversational rounds, in order."""
-    chain = _active_chain(_load(path))
+def _rounds_from_scan(scan: _Scan, chain: List[str]) -> List[Round]:
     rounds: List[Round] = []
     cur: Optional[Round] = None
-    for obj in chain:
-        u = obj.get("uuid")
-        if is_user_turn(obj):
-            cur = Round(index=len(rounds), user_uuid=u or "", user_text=_message_text(obj),
+    for u in chain:
+        if u in scan.turn:
+            cur = Round(index=len(rounds), user_uuid=u, user_text=scan.text.get(u, ""),
                         uuids=[], assistant_text="", line_count=0)
             rounds.append(cur)
         if cur is None:
-            # Leading non-user entries (rare) — fold into an implicit round 0.
             cur = Round(index=0, user_uuid="", user_text="(session start)",
                         uuids=[], assistant_text="", line_count=0)
             rounds.append(cur)
-        if u:
-            cur.uuids.append(u)
+        cur.uuids.append(u)
         cur.line_count += 1
-        if obj.get("type") == "assistant":
-            snippet = _message_text(obj)
+        if scan.role.get(u) == "assistant" and scan.kind.get(u) == "text":
+            snippet = scan.text.get(u, "")
             if snippet:
                 cur.assistant_text = snippet
     return rounds
+
+
+def list_rounds(path: Path) -> List[Round]:
+    """Split a transcript's active chain into conversational rounds, in order."""
+    scan = _scan(path)
+    return _rounds_from_scan(scan, _chain_uuids(scan))
 
 
 # ── trim plan + apply ─────────────────────────────────────────────────────────
@@ -382,35 +454,50 @@ def _set_entry_text(obj: dict, new_text: str) -> bool:
     return False
 
 
-def list_messages(path: Path, *, include_inactive: bool = False) -> List[MsgView]:
-    """Flatten a transcript into per-message views, in file order.
+_TURN_HIDDEN = ("thinking", "tool_use", "tool_result", "command", "meta")
+
+
+def list_messages(path: Path, *, include_inactive: bool = False,
+                  turns: bool = False) -> List[MsgView]:
+    """Flatten a transcript into per-message views (single streaming pass).
 
     By default only the active (resumable) chain is returned; pass
     ``include_inactive=True`` to also surface dead branches / sidechains.
+
+    With ``turns=True`` only the real conversation is kept — your messages and
+    the assistant's text replies — hiding thinking / tool calls / tool results /
+    slash-command plumbing. That is what the editor shows by default: a 400 MB
+    session with 69k raw message lines collapses to a few dozen readable turns.
     """
-    entries = _load(path)
-    chain_uuids = {o.get("uuid") for o in _active_chain(entries)}
-    # map uuid → round index
+    scan = _scan(path)
+    chain = _chain_uuids(scan)
+    chain_set = set(chain)
     round_of: dict = {}
-    for r in list_rounds(path):
+    for r in _rounds_from_scan(scan, chain):
         for u in r.uuids:
             round_of[u] = r.index
+
+    uuids = scan.order if include_inactive else chain
     views: List[MsgView] = []
-    for e in entries:
-        if e.obj is None or e.type not in _MSG_TYPES:
+    for u in uuids:
+        if u not in scan.role:
             continue
-        u = e.uuid
-        if not u:
+        if not include_inactive and u in scan.sidechain:
             continue
-        active = u in chain_uuids
-        if not active and not include_inactive:
-            continue
-        kind = _entry_kind(e.obj)
+        kind = scan.kind[u]
+        if turns:
+            # keep genuine human turns + assistant text replies only
+            if scan.role[u] == "user" and u not in scan.turn:
+                continue
+            if scan.role[u] == "assistant" and kind != "text":
+                continue
+            if kind in _TURN_HIDDEN:
+                continue
         views.append(MsgView(
-            uuid=u, role=e.type or "", kind=kind, text=_entry_full_text(e.obj),
+            uuid=u, role=scan.role[u], kind=kind, text=scan.text[u],
             round_index=round_of.get(u, -1),
             editable=(kind in ("text", "thinking")),
-            on_active_chain=active,
+            on_active_chain=u in chain_set,
         ))
     return views
 

@@ -45,10 +45,16 @@ class _Host(App):
         self.push_screen(MessageEditorScreen(self._session))
 
 
+async def _settle(app, pilot):
+    """Wait for the background load worker to finish, then flush the UI."""
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
 async def test_editor_mounts_and_lists_messages(session):
     app = _Host(session)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(app, pilot)
         screen = app.screen
         assert isinstance(screen, MessageEditorScreen)
         lv = screen.query_one("#msg-list", ListView)
@@ -56,13 +62,38 @@ async def test_editor_mounts_and_lists_messages(session):
         assert screen._selected().uuid == "u1"
 
 
+async def test_editor_turns_mode_hides_tool_noise(tmp_path):
+    f = tmp_path / "noisy.jsonl"
+    rows = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "message": {"role": "user", "content": "do it"}},
+        {"type": "assistant", "uuid": "t1", "parentUuid": "u1",
+         "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {}}]}},
+        {"type": "user", "uuid": "r1", "parentUuid": "t1", "toolUseResult": {"ok": 1},
+         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "r1",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+    ]
+    f.write_text("".join(_line(r) for r in rows))
+    s = Session(session_id="n", project_path=tmp_path, profile_name="t", file_path=f)
+    app = _Host(s)
+    async with app.run_test() as pilot:
+        await _settle(app, pilot)
+        screen = app.screen
+        # turns mode: only the user turn + the assistant text reply
+        assert [m.uuid for m in screen._msgs] == ["u1", "a1"]
+        screen.action_toggle_all()
+        await _settle(app, pilot)
+        assert [m.uuid for m in screen._msgs] == ["u1", "t1", "r1", "a1"]
+
+
 async def test_editor_edit_updates_file(session):
     app = _Host(session)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(app, pilot)
         screen = app.screen
         screen._do_edit("u1", "PILOT EDITED")
-        await pilot.pause()
+        await _settle(app, pilot)
         assert any(m.uuid == "u1" and m.text == "PILOT EDITED" for m in screen._msgs)
     objs = [json.loads(l) for l in session.file_path.read_text().splitlines() if l.strip()]
     u1 = next(o for o in objs if o.get("uuid") == "u1")
@@ -72,20 +103,20 @@ async def test_editor_edit_updates_file(session):
 async def test_editor_trim_to_here(session):
     app = _Host(session)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(app, pilot)
         screen = app.screen
         screen._do_trim("a1")        # keep through first answer
-        await pilot.pause()
+        await _settle(app, pilot)
         assert [m.uuid for m in screen._msgs] == ["u1", "a1"]
 
 
 async def test_editor_delete_message(session):
     app = _Host(session)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(app, pilot)
         screen = app.screen
         screen._do_delete("u2")
-        await pilot.pause()
+        await _settle(app, pilot)
         uuids = [m.uuid for m in screen._msgs]
         assert "u2" not in uuids and "a2" in uuids   # a2 re-linked, survives
 
@@ -93,7 +124,7 @@ async def test_editor_delete_message(session):
 async def test_editor_follow_toggle(session):
     app = _Host(session)
     async with app.run_test() as pilot:
-        await pilot.pause()
+        await _settle(app, pilot)
         screen = app.screen
         assert screen._follow is False
         screen.action_toggle_follow()

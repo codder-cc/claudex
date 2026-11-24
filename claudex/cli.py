@@ -1001,28 +1001,48 @@ def session_migrate(session_id: str, from_profile: str, to_profile: str, keep_th
 
 
 def _find_session(session_id: str, profile: Optional[str]):
-    """Resolve a session by exact id or unique prefix. Exits on miss/ambiguity."""
+    """Resolve a session by exact id or unique prefix. Exits on miss/ambiguity.
+
+    This globs the transcript *filenames* (the id is the file stem) instead of
+    parsing every transcript's contents — the latter reads whole multi-hundred-MB
+    files just to learn their titles, which made `history edit <id>` crawl before
+    the editor even opened.
+    """
+    from pathlib import Path
+    from claudex.history.models import Session
+    from claudex.history.parser import decode_project_path
+
     pm = _pm()
-    from claudex.history.browser import HistoryBrowser
     try:
-        browser = HistoryBrowser(pm.list())
+        profiles = [pm.get(profile)] if profile else pm.list()
     except ClaudexError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
-    candidates = [s for s in browser.get_all_sessions(profile_filter=profile)
-                  if s.session_id == session_id or s.session_id.startswith(session_id)]
-    exact = [s for s in candidates if s.session_id == session_id]
-    candidates = exact or candidates
-    if not candidates:
+
+    matches: list = []
+    for prof in profiles:
+        projects = Path(prof.config_dir) / "projects"
+        if not projects.exists():
+            continue
+        for proj in projects.iterdir():
+            if not proj.is_dir():
+                continue
+            for jf in proj.glob(f"{session_id}*.jsonl"):
+                matches.append((prof, proj, jf))
+    exact = [m for m in matches if m[2].stem == session_id]
+    matches = exact or matches
+    if not matches:
         where = f" in profile '{profile}'" if profile else ""
         console.print(f"[red]Session '{session_id}' not found{where}.[/red]")
         console.print("  Browse with [cyan]claudex session list[/cyan].")
         sys.exit(1)
-    if len(candidates) > 1:
+    if len(matches) > 1:
         console.print(f"[red]Ambiguous session id '{session_id}'[/red] — matches "
-                      f"{len(candidates)}. Use a longer id or --profile.")
+                      f"{len(matches)}. Use a longer id or --profile.")
         sys.exit(1)
-    return candidates[0]
+    prof, proj, jf = matches[0]
+    return Session(session_id=jf.stem, project_path=decode_project_path(proj.name),
+                   profile_name=prof.name, file_path=jf, title=jf.stem[:8])
 
 
 @session_group.command("rounds")
