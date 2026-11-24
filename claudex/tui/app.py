@@ -23,6 +23,10 @@ class ClaudexApp(App):
     TITLE = "claudex"
     SUB_TITLE = "Claude Code profile manager"
 
+    def __init__(self, open_session=None) -> None:
+        super().__init__()
+        self._open_session = open_session
+
     BINDINGS = [
         # Not priority: a priority binding would swallow "q"/"1".."4" typed into
         # Input fields (profile name, email, API key, search). ctrl+q always quits
@@ -74,6 +78,7 @@ class ClaudexApp(App):
             "\n"
             "[bold]History tab[/bold]\n"
             "  Enter    Resume selected session\n"
+            "  e        Edit messages (view / edit / delete / trim / follow)\n"
             "  m        Migrate session to another profile\n"
             "  x        Delete session\n"
             "  /        Focus search box\n"
@@ -95,11 +100,18 @@ class ClaudexApp(App):
         cfg = load_config()
         if cfg.theme == "light":
             self.dark = False
+        if self._open_session is not None:
+            self.query_one(TabbedContent).active = "history"
+            from claudex.tui.screens.message_editor import MessageEditorScreen
+            self.push_screen(MessageEditorScreen(self._open_session))
 
 
-def run_app() -> None:
-    """Launch the TUI and handle post-exit actions."""
-    result = ClaudexApp().run()
+def run_app(open_session=None) -> None:
+    """Launch the TUI and handle post-exit actions.
+
+    *open_session* jumps straight into that session's message editor.
+    """
+    result = ClaudexApp(open_session=open_session).run()
 
     if not result:
         return

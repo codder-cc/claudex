@@ -17,6 +17,7 @@ from claudex.history.models import Session
 class HistoryWidget(Widget):
     BINDINGS = [
         Binding("enter", "resume_session", "Resume", show=True),
+        Binding("e", "edit_messages", "Edit messages", show=True),
         Binding("m", "migrate_session", "Migrate", show=True),
         Binding("x", "delete_session", "Delete", show=True),
         Binding("/", "focus_search", "Search", show=True),
@@ -67,11 +68,13 @@ class HistoryWidget(Widget):
         table = self.query_one("#session-table", DataTable)
         table.clear()
         for s in sessions:
+            # The same session id can exist under two profiles (e.g. a migrated
+            # session), so the row key must include the profile to stay unique.
             table.add_row(
                 s.profile_name, s.age_human, s.title[:60],
                 str(s.message_count), f"{s.total_tokens.total:,}",
                 str(s.project_path)[-35:],
-                key=s.session_id,
+                key=f"{s.profile_name}/{s.session_id}",
             )
 
     def _reload_current(self) -> None:
@@ -95,7 +98,8 @@ class HistoryWidget(Widget):
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if not event.row_key:
             return
-        session = next((s for s in self._sessions if s.session_id == event.row_key.value), None)
+        session = next((s for s in self._sessions
+                        if f"{s.profile_name}/{s.session_id}" == event.row_key.value), None)
         if session:
             self.query_one("#session-detail", Static).update(
                 f"[bold]{session.title}[/bold]  |  "
@@ -121,6 +125,13 @@ class HistoryWidget(Widget):
             self.notify(f"Profile '{session.profile_name}' not found", severity="error")
             return
         self.app.exit(("resume", session.profile_name, profile.config_dir, session.session_id))
+
+    def action_edit_messages(self) -> None:
+        session = self._get_selected_session()
+        if not session:
+            return
+        from claudex.tui.screens.message_editor import MessageEditorScreen
+        self.app.push_screen(MessageEditorScreen(session))
 
     def action_migrate_session(self) -> None:
         session = self._get_selected_session()

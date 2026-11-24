@@ -178,6 +178,49 @@ Button.danger-btn {
     height: 3;
 }
 
+/* ─── Message Editor ──────────────────────────────────── */
+#editor-header {
+    height: auto;
+    padding: 0 1;
+    background: $primary-darken-2;
+    color: $text;
+}
+
+#editor-body {
+    height: 1fr;
+}
+
+#msg-list {
+    width: 45%;
+    border: tall $primary;
+}
+
+#msg-content {
+    width: 1fr;
+    border: tall $primary-darken-1;
+    padding: 1 2;
+    background: $surface;
+}
+
+#editor-hints {
+    height: 1;
+    padding: 0 1;
+    background: $primary-darken-3;
+}
+
+#edit-box {
+    width: 80%;
+    height: 80%;
+    border: double $accent;
+    padding: 1 2;
+    background: $surface;
+}
+
+#edit-area {
+    height: 1fr;
+    border: tall $primary;
+}
+
 /* ─── Status Bar ──────────────────────────────────────── */
 #status-bar {
     dock: bottom;

@@ -144,6 +144,106 @@ def test_empty_transcript_refused(tmp_path):
         edit.plan_trim_rounds(f, 1)
 
 
+def _chain_ok(path):
+    """Assert the active chain is unbroken and has no dangling tool_use."""
+    chain = edit._active_chain(edit._load(path))
+    # parent links form a single unbroken line
+    for child, parent in zip(chain[1:], chain):
+        assert child.get("parentUuid") == parent.get("uuid")
+    tu, tr = set(), set()
+    for o in chain:
+        for b in o.get("message", {}).get("content", []) or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                tu.add(b["id"])
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                tr.add(b["tool_use_id"])
+    assert tu <= tr
+    return chain
+
+
+def test_list_messages_flattens_active_chain(transcript):
+    msgs = edit.list_messages(transcript)
+    kinds = [(m.role, m.kind) for m in msgs]
+    assert ("user", "text") in kinds
+    assert ("assistant", "tool_use") in kinds
+    assert ("user", "tool_result") in kinds
+    # command plumbing shows up but is not editable
+    cmds = [m for m in msgs if m.kind == "command"]
+    assert cmds and all(not m.editable for m in cmds)
+    # every text user/assistant message is editable
+    assert all(m.editable for m in msgs if m.kind == "text")
+
+
+def test_edit_message_text_keeps_chain(transcript):
+    msgs = edit.list_messages(transcript)
+    first_user = next(m for m in msgs if m.role == "user" and m.kind == "text")
+    edit.edit_message_text(transcript, first_user.uuid, "EDITED QUESTION", backup=False)
+    msgs2 = edit.list_messages(transcript)
+    assert any(m.uuid == first_user.uuid and m.text == "EDITED QUESTION" for m in msgs2)
+    _chain_ok(transcript)
+
+
+def test_edit_nonexistent_message_raises(transcript):
+    with pytest.raises(edit.TrimError):
+        edit.edit_message_text(transcript, "no-such-uuid", "x")
+
+
+def test_delete_plain_message_relinks(transcript):
+    # delete the middle user text message "second question" (u2)
+    edit.delete_message(transcript, "u2", backup=False)
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    assert "u2" not in uuids
+    chain = _chain_ok(transcript)
+    # a2 (second answer's tool) was re-parented onto u2's parent (a1b)
+    assert any(o["uuid"] == "a2" and o["parentUuid"] == "a1b" for o in chain)
+
+
+def test_delete_tool_use_removes_its_result(transcript):
+    edit.delete_message(transcript, "a2", backup=False)   # a tool_use
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    assert "a2" not in uuids and "r2" not in uuids         # the result went too
+    _chain_ok(transcript)
+
+
+def test_delete_tool_result_removes_its_use(transcript):
+    edit.delete_message(transcript, "r2", backup=False)
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    assert "r2" not in uuids and "a2" not in uuids
+    _chain_ok(transcript)
+
+
+def test_delete_leaf_message(transcript):
+    # the active leaf is a3 (command plumbing c1/c2 are also leafmost); delete a3's round tail
+    edit.delete_message(transcript, "a3", backup=False)
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    assert "a3" not in uuids
+    _chain_ok(transcript)
+
+
+def test_truncate_to_cuts_tail(transcript):
+    edit.truncate_to(transcript, "a1b", backup=False)   # keep through first answer
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    assert {"u1", "a1", "r1", "a1b"} <= uuids
+    for gone in ("u2", "a2", "r2", "a2b", "u3", "a3"):
+        assert gone not in uuids
+    chain = _chain_ok(transcript)
+    assert chain[-1]["uuid"] == "a1b"
+
+
+def test_read_since_tails_appends(tmp_path):
+    f = tmp_path / "live.jsonl"
+    f.write_text(_line(_user("u1", None, "hi")))
+    msgs, off = edit.read_since(f, 0)
+    assert len(msgs) == 1 and off == f.stat().st_size
+    # append two more lines, then a partial (no newline)
+    with open(f, "a") as fh:
+        fh.write(_line(_assistant_text("a1", "u1", "hello")))
+        fh.write('{"partial": true')      # half-written line, no newline
+    msgs2, off2 = edit.read_since(f, off)
+    assert [m["uuid"] for m in msgs2] == ["a1"]      # partial line not consumed
+    assert off2 < f.stat().st_size
+
+
 def test_branch_only_active_chain_trimmed(tmp_path):
     """A dead branch (the user edited/branched) must be left untouched; only the
     active chain to the real leaf is considered."""

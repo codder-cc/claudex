@@ -39,6 +39,7 @@ class _Entry:
     """One parsed JSONL line plus its original raw text (byte-preserving)."""
     raw: str
     obj: Optional[dict]
+    dirty: bool = False   # obj was mutated → re-serialise instead of writing raw
 
     @property
     def uuid(self) -> Optional[str]:
@@ -300,3 +301,253 @@ def trim_rounds(path: Path, n: int, *, backup: bool = True,
         return plan, None
     bak = apply_trim(path, plan, backup=backup)
     return plan, bak
+
+
+# ── message-level view + edit ─────────────────────────────────────────────────
+@dataclass
+class MsgView:
+    """A single message entry, flattened for display and editing."""
+    uuid: str
+    role: str                  # "user" | "assistant"
+    kind: str                  # text | thinking | tool_use | tool_result | command | meta
+    text: str                  # full text for editable kinds; a label otherwise
+    round_index: int           # which conversational round it belongs to (0-based)
+    editable: bool             # True for plain text user / assistant messages
+    on_active_chain: bool      # False for dead branches / sidechains
+
+    @property
+    def preview(self) -> str:
+        return " ".join(self.text.split())[:80]
+
+
+def _entry_kind(obj: dict) -> str:
+    if obj.get("isMeta"):
+        return "meta"
+    if _is_command_plumbing(obj):
+        return "command"
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return "text"
+    if isinstance(content, list):
+        kinds = [b.get("type") for b in content if isinstance(b, dict)]
+        for k in ("tool_result", "tool_use", "thinking", "text"):
+            if k in kinds:
+                return k
+    return "text"
+
+
+def _entry_full_text(obj: dict) -> str:
+    """The editable text of a message, or a human label for non-text kinds."""
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                return b.get("text", "")
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "thinking":
+                return b.get("thinking", "")
+        # non-text: summarise
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                return f"[tool_use {b.get('name', '?')}] {json.dumps(b.get('input', {}))[:200]}"
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                c = b.get("content")
+                txt = c if isinstance(c, str) else json.dumps(c)[:200]
+                return f"[tool_result] {txt[:200]}"
+    return ""
+
+
+def _set_entry_text(obj: dict, new_text: str) -> bool:
+    """Replace a message's text in place. Returns False if it has no text slot."""
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = new_text
+        return True
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                b["text"] = new_text
+                return True
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "thinking":
+                b["thinking"] = new_text
+                return True
+    return False
+
+
+def list_messages(path: Path, *, include_inactive: bool = False) -> List[MsgView]:
+    """Flatten a transcript into per-message views, in file order.
+
+    By default only the active (resumable) chain is returned; pass
+    ``include_inactive=True`` to also surface dead branches / sidechains.
+    """
+    entries = _load(path)
+    chain_uuids = {o.get("uuid") for o in _active_chain(entries)}
+    # map uuid → round index
+    round_of: dict = {}
+    for r in list_rounds(path):
+        for u in r.uuids:
+            round_of[u] = r.index
+    views: List[MsgView] = []
+    for e in entries:
+        if e.obj is None or e.type not in _MSG_TYPES:
+            continue
+        u = e.uuid
+        if not u:
+            continue
+        active = u in chain_uuids
+        if not active and not include_inactive:
+            continue
+        kind = _entry_kind(e.obj)
+        views.append(MsgView(
+            uuid=u, role=e.type or "", kind=kind, text=_entry_full_text(e.obj),
+            round_index=round_of.get(u, -1),
+            editable=(kind in ("text", "thinking")),
+            on_active_chain=active,
+        ))
+    return views
+
+
+def _commit(path: Path, entries: List[_Entry], *, backup: bool) -> Optional[Path]:
+    """Write *entries* back atomically, re-serialising any marked ``dirty``."""
+    bak: Optional[Path] = None
+    if backup:
+        bak = _backup_path(path)
+        shutil.copy2(path, bak)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as out:
+        for e in entries:
+            if e.obj is None:                       # blank / unparseable: verbatim
+                out.write(e.raw if e.raw.endswith("\n") else e.raw + "\n")
+                continue
+            if e.dirty:
+                out.write(json.dumps(e.obj, ensure_ascii=False,
+                                     separators=(",", ":")) + "\n")
+            else:
+                out.write(e.raw if e.raw.endswith("\n") else e.raw + "\n")
+    try:
+        tmp.chmod(_TRANSCRIPT_MODE)
+    except OSError:
+        pass
+    tmp.replace(path)
+    return bak
+
+
+def edit_message_text(path: Path, uuid: str, new_text: str, *,
+                      backup: bool = True) -> Optional[Path]:
+    """Replace the text of one message (user or assistant) in place.
+
+    Only the message's text changes; the ``parentUuid`` chain is untouched, so
+    the transcript stays resumable. Raises :class:`TrimError` if *uuid* is not a
+    message with an editable text slot.
+    """
+    entries = _load(path)
+    for e in entries:
+        if e.obj is not None and e.uuid == uuid:
+            if e.type not in _MSG_TYPES or not _set_entry_text(e.obj, new_text):
+                raise TrimError(f"message {uuid[:8]} has no editable text")
+            e.dirty = True
+            return _commit(path, entries, backup=backup)
+    raise TrimError(f"message {uuid[:8]} not found")
+
+
+def _deletion_group(entries: List[_Entry], uuid: str) -> set:
+    """UUIDs removed together with *uuid* — a tool_use and its tool_result are an
+    inseparable pair, so deleting one deletes both."""
+    by_uuid = {e.uuid: e for e in entries if e.obj is not None and e.uuid}
+    target = by_uuid.get(uuid)
+    if target is None:
+        raise TrimError(f"message {uuid[:8]} not found")
+    group = {uuid}
+    kind = _entry_kind(target.obj)
+    if kind == "tool_use":
+        # its result is the child user line carrying the same tool_use_id
+        ids = {b.get("id") for b in (target.obj.get("message", {}).get("content") or [])
+               if isinstance(b, dict) and b.get("type") == "tool_use"}
+        for e in entries:
+            if e.obj is None or e.type != "user":
+                continue
+            for b in (e.obj.get("message", {}).get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in ids:
+                    group.add(e.uuid)
+    elif kind == "tool_result":
+        group.add(target.parent)   # the tool_use assistant line is the parent
+    group.discard(None)
+    return group
+
+
+def delete_message(path: Path, uuid: str, *, backup: bool = True) -> Optional[Path]:
+    """Delete one message from the active chain, re-linking around the gap.
+
+    The successor's ``parentUuid`` is spliced onto the deleted node's parent so
+    the chain stays unbroken and resumable. A ``tool_use`` and its ``tool_result``
+    are always removed together (deleting half would orphan the other).
+    """
+    entries = _load(path)
+    chain = _active_chain(entries)
+    chain_pos = {o.get("uuid"): i for i, o in enumerate(chain)}
+    if uuid not in chain_pos:
+        raise TrimError(f"message {uuid[:8]} is not on the active chain")
+    group = _deletion_group(entries, uuid)
+    positions = sorted(chain_pos[u] for u in group if u in chain_pos)
+    first_pos, last_pos = positions[0], positions[-1]
+    new_parent = chain[first_pos].get("parentUuid")        # parent of the group head
+    # Re-link the active-chain successor (if any) onto new_parent.
+    if last_pos + 1 < len(chain):
+        succ_uuid = chain[last_pos + 1].get("uuid")
+        for e in entries:
+            if e.obj is not None and e.uuid == succ_uuid:
+                e.obj["parentUuid"] = new_parent
+                e.dirty = True
+                break
+    # Drop the group and anything (tool results, progress) still pointing at it,
+    # but never the successor we just re-linked.
+    kept = [e for e in entries
+            if e.obj is None or (e.uuid not in group and e.parent not in group)]
+    return _commit(path, kept, backup=backup)
+
+
+def truncate_to(path: Path, uuid: str, *, backup: bool = True) -> Optional[Path]:
+    """Keep the transcript up to and including *uuid*; drop everything after it
+    on the active chain. A convenient "trim from here down" for the editor."""
+    entries = _load(path)
+    chain = _active_chain(entries)
+    pos = {o.get("uuid"): i for i, o in enumerate(chain)}
+    if uuid not in pos:
+        raise TrimError(f"message {uuid[:8]} is not on the active chain")
+    removed = {o.get("uuid") for o in chain[pos[uuid] + 1:]}
+    if not removed:
+        return None   # already the leaf → nothing to do
+    kept = [e for e in entries
+            if e.obj is None or (e.uuid not in removed and e.parent not in removed)]
+    return _commit(path, kept, backup=backup)
+
+
+def read_since(path: Path, offset: int) -> tuple[List[dict], int]:
+    """For live-follow: return message objects appended past byte *offset*,
+    plus the new end offset. Partial trailing lines are not consumed."""
+    out: List[dict] = []
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        f.seek(offset)
+        consumed = offset
+        for raw in f:
+            if not raw.endswith("\n"):
+                break   # partial line still being written — stop, re-read next tick
+            consumed += len(raw.encode("utf-8", "replace"))
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(obj, dict) and obj.get("type") in _MSG_TYPES:
+                out.append(obj)
+    return out, consumed

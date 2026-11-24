@@ -32,6 +32,10 @@ Usage:
 
   -- History --
   claudex history                       Open history browser (TUI)
+  claudex history edit [id]             Edit messages: view/edit/delete/trim/follow
+  claudex history list [id]             List sessions, or one session's messages
+  claudex session rounds <id>           Preview a session's conversational rounds
+  claudex session trim <id> --last N    Drop the last N rounds from a session
   claudex search <query>                Search sessions by title/project
 
   -- Shell --
@@ -1104,24 +1108,80 @@ def session_trim(session_id: str, last: int, profile: Optional[str],
 
 # ─── History command ───────────────────────────────────────────────────────────
 
-@cli.command("history")
+@cli.group("history", invoke_without_command=True)
 @click.option("--profile", "-p", default=None)
 @click.option("--limit", "-n", default=20)
-def history_cmd(profile: Optional[str], limit: int) -> None:
-    """Browse session history.
+@click.pass_context
+def history_group(ctx: click.Context, profile: Optional[str], limit: int) -> None:
+    """Browse and edit session history.
 
-    With no options this opens the interactive TUI. When --profile or --limit is
-    given, a non-interactive table is printed instead (the TUI can't be
-    pre-filtered from the CLI).
+    \b
+      claudex history                 open the interactive TUI
+      claudex history edit [id]       open the message editor (id jumps straight in)
+      claudex history list [id]       print sessions, or one session's messages
+
+    With no subcommand: bare `history` opens the TUI; --profile/--limit print a
+    filtered table instead.
     """
-    # No filters → interactive browser.
+    if ctx.invoked_subcommand is not None:
+        return
+    # No subcommand, no filters → interactive browser.
     if profile is None and limit == 20:
         from claudex.tui.app import run_app
         run_app()
         return
-    # Filters given → render the same table as `session list` so the flags work.
-    ctx = click.get_current_context()
     ctx.invoke(session_list, name=profile, limit=limit, full_id=False)
+
+
+@history_group.command("edit")
+@click.argument("session_id", required=False)
+@click.option("--profile", "-p", default=None, help="Limit the search to one profile")
+def history_edit(session_id: Optional[str], profile: Optional[str]) -> None:
+    """Open the message editor (TUI). With an id, jump straight into that session.
+
+    In the editor: e edit text · x delete · t trim-to-here · f live-follow · esc back.
+    """
+    from claudex.tui.app import run_app
+    session = _find_session(session_id, profile) if session_id else None
+    run_app(open_session=session)
+
+
+@history_group.command("list")
+@click.argument("session_id", required=False)
+@click.option("--profile", "-p", default=None, help="Limit the search to one profile")
+@click.option("--limit", "-n", default=20, help="Sessions to show (no id given)")
+@click.option("--all", "show_all", is_flag=True, help="Also show dead branches / sidechains")
+def history_list(session_id: Optional[str], profile: Optional[str],
+                 limit: int, show_all: bool) -> None:
+    """List sessions, or — with an id — every message in one session."""
+    if not session_id:
+        ctx = click.get_current_context()
+        ctx.invoke(session_list, name=profile, limit=limit, full_id=False)
+        return
+    from claudex.history import edit
+    session = _find_session(session_id, profile)
+    msgs = edit.list_messages(session.file_path, include_inactive=show_all)
+    if not msgs:
+        console.print("[yellow]No messages in this session.[/yellow]")
+        return
+    table = Table(title=f"Messages — {session.title[:50]}  ({len(msgs)} shown)",
+                  header_style="bold cyan")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("round", justify="right", style="dim")
+    table.add_column("role")
+    table.add_column("kind")
+    table.add_column("uuid", style="dim")
+    table.add_column("preview")
+    for i, m in enumerate(msgs):
+        rnd = str(m.round_index + 1) if m.round_index >= 0 else "–"
+        role_style = "green" if m.role == "user" else "cyan"
+        flag = "" if m.editable else " 🔒"
+        off = "" if m.on_active_chain else " [red](branch)[/red]"
+        table.add_row(str(i + 1), rnd, f"[{role_style}]{m.role}[/]",
+                      m.kind + flag, m.uuid[:8], m.preview + off)
+    console.print(table)
+    console.print(f"[dim]Edit interactively: [cyan]claudex history edit "
+                  f"{session.session_id[:12]}[/cyan][/dim]")
 
 
 @cli.command("search")
