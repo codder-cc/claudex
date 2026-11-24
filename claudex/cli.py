@@ -1126,6 +1126,44 @@ def session_trim(session_id: str, last: int, profile: Optional[str],
     console.print(f"  Resume: [cyan]claudex session resume -id {session.session_id}[/cyan]")
 
 
+@session_group.command("replace")
+@click.argument("session_id")
+@click.argument("find")
+@click.argument("replacement")
+@click.option("--profile", "-p", default=None, help="Limit the search to one profile")
+@click.option("--regex", is_flag=True, help="Treat FIND as a regular expression")
+@click.option("--dry-run", is_flag=True, help="Count matches without writing")
+@click.option("--no-backup", is_flag=True, help="Don't write a .bak copy")
+def session_replace(session_id: str, find: str, replacement: str, profile: Optional[str],
+                    regex: bool, dry_run: bool, no_backup: bool) -> None:
+    """Find/replace across every message of a session (e.g. scrub a secret)."""
+    from claudex.history import edit
+    session = _find_session(session_id, profile)
+    try:
+        n = edit.replace_text(session.file_path, find, replacement,
+                              regex=regex, dry_run=dry_run, backup=not no_backup)
+    except edit.TrimError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    verb = "would change" if dry_run else "changed"
+    console.print(f"[green]✓[/green] {verb} {n} message(s).")
+
+
+@session_group.command("delete-errors")
+@click.argument("session_id")
+@click.option("--profile", "-p", default=None, help="Limit the search to one profile")
+@click.option("--no-backup", is_flag=True, help="Don't write a .bak copy")
+def session_delete_errors(session_id: str, profile: Optional[str], no_backup: bool) -> None:
+    """Delete all synthetic API-error / refusal messages from a session."""
+    from claudex.history import edit
+    session = _find_session(session_id, profile)
+    n, bak = edit.delete_errors(session.file_path, backup=not no_backup)
+    console.print(f"[green]✓[/green] Deleted {n} error message(s)." if n
+                  else "[yellow]No error messages found.[/yellow]")
+    if bak:
+        console.print(f"  Backup: {bak}")
+
+
 # ─── History command ───────────────────────────────────────────────────────────
 
 @cli.group("history", invoke_without_command=True)

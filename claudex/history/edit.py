@@ -23,11 +23,13 @@ Everything here only reads and rewrites the one JSONL file; a timestamped
 from __future__ import annotations
 
 import json
+import re
 import shutil
+import uuid as _uuidlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 _TRANSCRIPT_MODE = 0o600
 _MSG_TYPES = ("user", "assistant")
@@ -182,6 +184,7 @@ class _Scan:
     role: dict           # message uuid → "user" | "assistant"
     kind: dict           # message uuid → text|thinking|tool_use|tool_result|command|meta
     text: dict           # message uuid → full text (or a label for non-text kinds)
+    edit: dict           # message uuid → editable payload, for tool kinds only
     turn: set            # message uuids that are genuine human turns
     sidechain: set       # message uuids on subagent sidechains
     leaf: Optional[str]  # last non-sidechain message in file order
@@ -189,7 +192,7 @@ class _Scan:
 
 
 def _scan(path: Path) -> _Scan:
-    s = _Scan(parent_of={}, role={}, kind={}, text={}, turn=set(),
+    s = _Scan(parent_of={}, role={}, kind={}, text={}, edit={}, turn=set(),
               sidechain=set(), leaf=None, order=[])
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -207,8 +210,11 @@ def _scan(path: Path) -> _Scan:
             s.parent_of[u] = obj.get("parentUuid")
             if obj.get("type") in _MSG_TYPES:
                 s.role[u] = obj["type"]
-                s.kind[u] = _entry_kind(obj)
+                kind = _entry_kind(obj)
+                s.kind[u] = kind
                 s.text[u] = _entry_full_text(obj)
+                if kind in ("tool_result", "tool_use"):
+                    s.edit[u] = _edit_payload(obj, kind)
                 if is_user_turn(obj):
                     s.turn.add(u)
                 if obj.get("isSidechain"):
@@ -384,8 +390,9 @@ class MsgView:
     kind: str                  # text | thinking | tool_use | tool_result | command | meta
     text: str                  # full text for editable kinds; a label otherwise
     round_index: int           # which conversational round it belongs to (0-based)
-    editable: bool             # True for plain text user / assistant messages
+    editable: bool             # True when the edit box can open this message
     on_active_chain: bool      # False for dead branches / sidechains
+    edit_text: str = ""        # exactly what the edit box should show
 
     @property
     def preview(self) -> str:
@@ -460,6 +467,60 @@ def _set_entry_text(obj: dict, new_text: str) -> bool:
     return False
 
 
+# kinds the editor lets you open in the text box
+_EDITABLE_KINDS = ("text", "thinking", "tool_result", "tool_use")
+
+
+def _edit_payload(obj: dict, kind: str) -> str:
+    """The exact string the edit box should show for a message of *kind*."""
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    if kind in ("text", "thinking"):
+        return _entry_full_text(obj)
+    if isinstance(content, list):
+        if kind == "tool_result":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, str):
+                        return c
+                    if isinstance(c, list):  # content blocks
+                        return "\n".join(x.get("text", "") for x in c
+                                         if isinstance(x, dict) and x.get("type") == "text")
+                    return json.dumps(c, ensure_ascii=False, indent=2)
+        if kind == "tool_use":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    return json.dumps(b.get("input", {}), ensure_ascii=False, indent=2)
+    return ""
+
+
+def _set_message_payload(obj: dict, kind: str, new_text: str) -> bool:
+    """Write the edited payload back into a message of *kind*. For ``tool_use``
+    the text must be valid JSON (the tool input)."""
+    if kind in ("text", "thinking"):
+        return _set_entry_text(obj, new_text)
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    if kind == "tool_result":
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                b["content"] = new_text
+                return True
+    if kind == "tool_use":
+        try:
+            parsed = json.loads(new_text)
+        except (json.JSONDecodeError, ValueError):
+            raise TrimError("tool input must be valid JSON")
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                b["input"] = parsed
+                return True
+    return False
+
+
 _TURN_HIDDEN = ("thinking", "tool_use", "tool_result", "command", "meta", "error")
 
 
@@ -502,8 +563,9 @@ def list_messages(path: Path, *, include_inactive: bool = False,
         views.append(MsgView(
             uuid=u, role=scan.role[u], kind=kind, text=scan.text[u],
             round_index=round_of.get(u, -1),
-            editable=(kind in ("text", "thinking")),
+            editable=(kind in _EDITABLE_KINDS),
             on_active_chain=u in chain_set,
+            edit_text=scan.edit.get(u, scan.text[u]),
         ))
     return views
 
@@ -544,7 +606,9 @@ def edit_message_text(path: Path, uuid: str, new_text: str, *,
     entries = _load(path)
     for e in entries:
         if e.obj is not None and e.uuid == uuid:
-            if e.type not in _MSG_TYPES or not _set_entry_text(e.obj, new_text):
+            if e.type not in _MSG_TYPES:
+                raise TrimError(f"message {uuid[:8]} has no editable text")
+            if not _set_message_payload(e.obj, _entry_kind(e.obj), new_text):
                 raise TrimError(f"message {uuid[:8]} has no editable text")
             e.dirty = True
             return _commit(path, entries, backup=backup)
@@ -576,35 +640,80 @@ def _deletion_group(entries: List[_Entry], uuid: str) -> set:
     return group
 
 
+def _delete_from_entries(entries: List[_Entry], remove: set) -> List[_Entry]:
+    """Drop *remove* from the active chain, re-linking every surviving node onto
+    its nearest surviving ancestor. Handles scattered removals in one pass, so it
+    backs single-message, whole-round and bulk deletions alike.
+
+    Also drops non-chain lines (tool results, progress) orphaned by the removal.
+    """
+    chain = _active_chain(entries)
+    entry_by_uuid = {e.uuid: e for e in entries if e.obj is not None and e.uuid}
+    prev_kept = chain[0].get("parentUuid") if chain else None
+    for obj in chain:
+        u = obj.get("uuid")
+        if u in remove:
+            continue
+        if obj.get("parentUuid") != prev_kept:
+            obj["parentUuid"] = prev_kept
+            if u in entry_by_uuid:
+                entry_by_uuid[u].dirty = True
+        prev_kept = u
+    return [e for e in entries
+            if e.obj is None or (e.uuid not in remove and e.parent not in remove)]
+
+
 def delete_message(path: Path, uuid: str, *, backup: bool = True) -> Optional[Path]:
     """Delete one message from the active chain, re-linking around the gap.
 
-    The successor's ``parentUuid`` is spliced onto the deleted node's parent so
-    the chain stays unbroken and resumable. A ``tool_use`` and its ``tool_result``
-    are always removed together (deleting half would orphan the other).
+    A ``tool_use`` and its ``tool_result`` are always removed together (deleting
+    half would orphan the other), and the chain stays unbroken and resumable.
     """
     entries = _load(path)
-    chain = _active_chain(entries)
-    chain_pos = {o.get("uuid"): i for i, o in enumerate(chain)}
-    if uuid not in chain_pos:
+    chain_uuids = {o.get("uuid") for o in _active_chain(entries)}
+    if uuid not in chain_uuids:
         raise TrimError(f"message {uuid[:8]} is not on the active chain")
-    group = _deletion_group(entries, uuid)
-    positions = sorted(chain_pos[u] for u in group if u in chain_pos)
-    first_pos, last_pos = positions[0], positions[-1]
-    new_parent = chain[first_pos].get("parentUuid")        # parent of the group head
-    # Re-link the active-chain successor (if any) onto new_parent.
-    if last_pos + 1 < len(chain):
-        succ_uuid = chain[last_pos + 1].get("uuid")
-        for e in entries:
-            if e.obj is not None and e.uuid == succ_uuid:
-                e.obj["parentUuid"] = new_parent
-                e.dirty = True
-                break
-    # Drop the group and anything (tool results, progress) still pointing at it,
-    # but never the successor we just re-linked.
-    kept = [e for e in entries
-            if e.obj is None or (e.uuid not in group and e.parent not in group)]
-    return _commit(path, kept, backup=backup)
+    remove = _deletion_group(entries, uuid)
+    return _commit(path, _delete_from_entries(entries, remove), backup=backup)
+
+
+def delete_round(path: Path, round_index: int, *, backup: bool = True) -> Optional[Path]:
+    """Delete every message in one conversational round, re-linking around it."""
+    scan = _scan(path)
+    rounds = _rounds_from_scan(scan, _chain_uuids(scan))
+    match = [r for r in rounds if r.index == round_index]
+    if not match:
+        raise TrimError(f"round {round_index + 1} not found (session has {len(rounds)})")
+    if len(rounds) <= 1:
+        raise TrimError("can't delete the only round — delete the session instead")
+    entries = _load(path)
+    remove = set(match[0].uuids)
+    return _commit(path, _delete_from_entries(entries, remove), backup=backup)
+
+
+def delete_messages(path: Path, uuids, *, backup: bool = True) -> tuple[int, Optional[Path]]:
+    """Delete several messages at once (each re-linked, tool pairs expanded).
+    Returns ``(count_removed, backup_path)``."""
+    entries = _load(path)
+    want = set(uuids)
+    remove: set = set()
+    for u in want:
+        try:
+            remove |= _deletion_group(entries, u)
+        except TrimError:
+            continue
+    if not remove:
+        return 0, None
+    bak = _commit(path, _delete_from_entries(entries, remove), backup=backup)
+    return len(remove), bak
+
+
+def delete_errors(path: Path, *, backup: bool = True) -> tuple[int, Optional[Path]]:
+    """Delete all synthetic API-error / refusal messages. Returns (count, bak)."""
+    errs = [m.uuid for m in list_messages(path) if m.kind == "error"]
+    if not errs:
+        return 0, None
+    return delete_messages(path, errs, backup=backup)
 
 
 def truncate_to(path: Path, uuid: str, *, backup: bool = True) -> Optional[Path]:
@@ -621,6 +730,137 @@ def truncate_to(path: Path, uuid: str, *, backup: bool = True) -> Optional[Path]
     kept = [e for e in entries
             if e.obj is None or (e.uuid not in removed and e.parent not in removed)]
     return _commit(path, kept, backup=backup)
+
+
+def insert_message(path: Path, after_uuid: str, role: str, text: str, *,
+                   backup: bool = True) -> str:
+    """Insert a new ``user`` / ``assistant`` message right after *after_uuid* on
+    the active chain, re-linking the successor onto it. Returns the new uuid.
+
+    Use it to steer a ``--resume`` (add a user instruction) or to supply context
+    the agent is missing. Pass the leaf's uuid to append at the end.
+    """
+    if role not in ("user", "assistant"):
+        raise TrimError("role must be 'user' or 'assistant'")
+    entries = _load(path)
+    after = next((e for e in entries if e.obj is not None and e.uuid == after_uuid), None)
+    if after is None:
+        raise TrimError(f"message {after_uuid[:8]} not found")
+    chain = _active_chain(entries)
+    pos = {o.get("uuid"): i for i, o in enumerate(chain)}
+    if after_uuid not in pos:
+        raise TrimError(f"message {after_uuid[:8]} is not on the active chain")
+
+    new_uuid = str(_uuidlib.uuid4())
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    content = text if role == "user" else [{"type": "text", "text": text}]
+    newobj = {"type": role, "uuid": new_uuid, "parentUuid": after_uuid,
+              "message": {"role": role, "content": content}, "timestamp": ts}
+    for k in ("sessionId", "cwd", "gitBranch", "version", "userType"):
+        if k in after.obj:
+            newobj[k] = after.obj[k]
+
+    i = pos[after_uuid]
+    if i + 1 < len(chain):                      # re-link the successor onto the insert
+        succ = chain[i + 1].get("uuid")
+        for e in entries:
+            if e.obj is not None and e.uuid == succ:
+                e.obj["parentUuid"] = new_uuid
+                e.dirty = True
+                break
+
+    new_entry = _Entry(raw="", obj=newobj, dirty=True)
+    out: List[_Entry] = []
+    for e in entries:
+        out.append(e)
+        if e is after:
+            out.append(new_entry)
+    _commit(path, out, backup=backup)
+    return new_uuid
+
+
+def _replace_in(node, fn: Callable[[str], str]) -> int:
+    """Recursively apply *fn* to every string leaf of *node* in place. Returns
+    the number of string fields that changed."""
+    n = 0
+    if isinstance(node, dict):
+        for k, v in list(node.items()):
+            if isinstance(v, str):
+                nv = fn(v)
+                if nv != v:
+                    node[k] = nv
+                    n += 1
+            else:
+                n += _replace_in(v, fn)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if isinstance(v, str):
+                nv = fn(v)
+                if nv != v:
+                    node[i] = nv
+                    n += 1
+            else:
+                n += _replace_in(v, fn)
+    return n
+
+
+def replace_text(path: Path, find: str, repl: str, *, regex: bool = False,
+                 backup: bool = True, dry_run: bool = False) -> int:
+    """Find/replace across every message's text (content, tool results, tool
+    inputs, thinking). Returns the number of messages changed.
+
+    Only message *content* is touched — ids, roles and the parentUuid chain are
+    left alone — so the transcript stays valid and resumable. Handy for scrubbing
+    a leaked secret out of a whole session at once.
+    """
+    if not find:
+        raise TrimError("nothing to find")
+    pattern = re.compile(find) if regex else None
+
+    def sub(s: str) -> str:
+        return pattern.sub(repl, s) if pattern else s.replace(find, repl)
+
+    changed = 0
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    bak: Optional[Path] = None
+    if not dry_run:
+        if backup:
+            bak = _backup_path(path)
+            shutil.copy2(path, bak)
+        out = open(tmp, "w", encoding="utf-8", newline="")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fin:
+            for raw in fin:
+                line = raw.rstrip("\n")
+                obj = None
+                if line.strip():
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        obj = None
+                hit = 0
+                if isinstance(obj, dict) and obj.get("type") in _MSG_TYPES:
+                    hit += _replace_in(obj.get("message"), sub)
+                    if "toolUseResult" in obj:
+                        hit += _replace_in(obj["toolUseResult"], sub)
+                if hit:
+                    changed += 1
+                if not dry_run:
+                    if hit:
+                        out.write(json.dumps(obj, ensure_ascii=False,
+                                             separators=(",", ":")) + "\n")
+                    else:
+                        out.write(raw if raw.endswith("\n") or not raw else raw + "\n")
+    finally:
+        if not dry_run:
+            out.close()
+    if not dry_run:
+        try:
+            tmp.chmod(_TRANSCRIPT_MODE)
+        except OSError:
+            pass
+        tmp.replace(path)
+    return changed
 
 
 def read_since(path: Path, offset: int) -> tuple[List[dict], int]:

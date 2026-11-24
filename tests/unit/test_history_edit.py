@@ -288,3 +288,87 @@ def test_api_error_messages_are_hidden_from_turns(tmp_path):
     assert next(m for m in all_msgs if m.uuid == "e1").kind == "error"
     turns = edit.list_messages(f, turns=True)
     assert [m.uuid for m in turns] == ["u1", "a1"]   # the error turn is hidden
+
+
+# ── insert / replace / tool-edit / round+bulk delete ──────────────────────────
+def test_edit_tool_result_and_tool_use(transcript):
+    edit.edit_message_text(transcript, "r1", "CHANGED RESULT", backup=False)
+    edit.edit_message_text(transcript, "a1", '{"cmd": "new"}', backup=False)
+    objs = {o["uuid"]: o for o in (json.loads(l) for l in transcript.read_text().splitlines() if l.strip())
+            if o.get("uuid")}
+    r1 = objs["r1"]["message"]["content"][0]
+    assert r1["content"] == "CHANGED RESULT"
+    a1 = objs["a1"]["message"]["content"][0]
+    assert a1["input"] == {"cmd": "new"}
+    _chain_ok(transcript)
+
+
+def test_edit_tool_use_rejects_bad_json(transcript):
+    with pytest.raises(edit.TrimError):
+        edit.edit_message_text(transcript, "a1", "not json", backup=False)
+
+
+def test_insert_message_relinks(transcript):
+    new = edit.insert_message(transcript, "a1b", "user", "injected steer", backup=False)
+    msgs = {m.uuid: m for m in edit.list_messages(transcript)}
+    assert new in msgs and msgs[new].role == "user" and msgs[new].text == "injected steer"
+    chain = _chain_ok(transcript)
+    order = [o["uuid"] for o in chain]
+    assert order.index("a1b") < order.index(new) < order.index("u2")  # spliced between
+
+
+def test_insert_at_leaf_appends(transcript):
+    # a3 is the last real assistant message (c1/c2 command plumbing follow it)
+    new = edit.insert_message(transcript, "a3", "user", "one more", backup=False)
+    assert any(m.uuid == new for m in edit.list_messages(transcript))
+    _chain_ok(transcript)
+
+
+def test_delete_round(transcript):
+    edit.delete_round(transcript, 0, backup=False)   # removes u1,a1,r1,a1b
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    for gone in ("u1", "a1", "r1", "a1b"):
+        assert gone not in uuids
+    assert "u2" in uuids
+    _chain_ok(transcript)
+
+
+def test_delete_messages_bulk(transcript):
+    count, _ = edit.delete_messages(transcript, ["u1", "u2"], backup=False)
+    assert count >= 2
+    uuids = {json.loads(l).get("uuid") for l in transcript.read_text().splitlines() if l.strip()}
+    assert "u1" not in uuids and "u2" not in uuids and "u3" in uuids
+    _chain_ok(transcript)
+
+
+def test_delete_errors(tmp_path):
+    f = tmp_path / "e.jsonl"
+    rows = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "uuid": "e1", "parentUuid": "u1", "isApiErrorMessage": True,
+         "message": {"role": "assistant", "model": "<synthetic>",
+                     "content": [{"type": "text", "text": "API Error: safeguards flagged"}]}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "e1",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
+    ]
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    count, bak = edit.delete_errors(f, backup=False)
+    assert count == 1
+    uuids = {json.loads(l).get("uuid") for l in f.read_text().splitlines() if l.strip()}
+    assert "e1" not in uuids and {"u1", "a1"} <= uuids
+    _chain_ok(f)
+
+
+def test_replace_text_across_session(transcript):
+    n = edit.replace_text(transcript, "second", "2nd", backup=False)
+    assert n >= 1
+    text = transcript.read_text()
+    assert "second question" not in text and "2nd question" in text
+
+
+def test_replace_text_regex_and_dryrun(transcript):
+    before = transcript.read_text()
+    n = edit.replace_text(transcript, r"first|third", "X", regex=True, dry_run=True)
+    assert n >= 1
+    assert transcript.read_text() == before          # dry run changed nothing

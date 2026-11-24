@@ -27,7 +27,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Label, ListItem, ListView, Static, TextArea
+from textual.widgets import Button, Input, Label, ListItem, ListView, Static, TextArea
 
 from claudex.history import edit
 from claudex.history.models import Session
@@ -46,12 +46,16 @@ _KIND_STYLE = {
 class MessageEditorScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "Back", show=True),
-        Binding("e", "edit_msg", "Edit text", show=True),
+        Binding("e", "edit_msg", "Edit", show=True),
+        Binding("i", "insert_msg", "Insert", show=True),
         Binding("x", "delete_msg", "Delete", show=True),
+        Binding("d", "delete_round", "Del round", show=True),
+        Binding("R", "replace", "Find/replace", show=True),
+        Binding("E", "delete_errors", "Del errors", show=True),
         Binding("t", "trim_here", "Trim to here", show=True),
         Binding("a", "toggle_all", "All / turns", show=True),
         Binding("f", "toggle_follow", "Follow", show=True),
-        Binding("r", "reload", "Reload", show=True),
+        Binding("r", "reload", "Reload", show=False),
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
     ]
@@ -76,8 +80,8 @@ class MessageEditorScreen(Screen):
                 with VerticalScroll(id="msg-content"):
                     yield Static("", id="msg-content-body")
             yield Static(
-                "[dim]e edit · x delete · t trim-to-here · a all/turns · "
-                "f follow · r reload · esc back[/dim]",
+                "[dim]e edit · i insert · x del · d del-round · R replace · "
+                "E del-errors · t trim · a all/turns · f follow · esc[/dim]",
                 id="editor-hints",
             )
 
@@ -179,10 +183,11 @@ class MessageEditorScreen(Screen):
         if not m:
             return
         if not m.editable:
-            self.notify(f"{m.kind} messages aren't text-editable", severity="warning")
+            self.notify(f"{m.kind} messages aren't editable", severity="warning")
             return
+        hint = "  (JSON tool input)" if m.kind == "tool_use" else ""
         self.app.push_screen(
-            EditTextModal(m.text, f"{m.role} · {m.kind} · {m.uuid[:8]}"),
+            EditTextModal(m.edit_text, f"{m.role} · {m.kind} · {m.uuid[:8]}{hint}"),
             lambda new: self._do_edit(m.uuid, new) if new is not None else None,
         )
 
@@ -194,6 +199,72 @@ class MessageEditorScreen(Screen):
             return
         self._reload()
         self.notify("Message edited (backup written).")
+
+    def action_insert_msg(self) -> None:
+        m = self._selected()
+        if not m:
+            return
+        self.app.push_screen(
+            InsertModal(m.preview or m.uuid[:8]),
+            lambda res: self._do_insert(m.uuid, res) if res else None,
+        )
+
+    def _do_insert(self, after_uuid: str, res) -> None:
+        role, text = res
+        try:
+            edit.insert_message(self._path, after_uuid, role, text)
+        except edit.TrimError as e:
+            self.notify(str(e), severity="error")
+            return
+        self._reload()
+        self.notify(f"Inserted a {role} message (backup written).")
+
+    def action_replace(self) -> None:
+        self.app.push_screen(ReplaceModal(),
+                             lambda res: self._do_replace(res) if res else None)
+
+    def _do_replace(self, res) -> None:
+        find, repl = res
+        try:
+            n = edit.replace_text(self._path, find, repl)
+        except edit.TrimError as e:
+            self.notify(str(e), severity="error")
+            return
+        self._reload()
+        self.notify(f"Replaced in {n} message(s) (backup written).")
+
+    def action_delete_round(self) -> None:
+        m = self._selected()
+        if not m or m.round_index < 0:
+            return
+        from claudex.tui.screens.dashboard import ConfirmModal
+        self.app.push_screen(
+            ConfirmModal(f"Delete the whole round {m.round_index + 1}?",
+                         "every message in this exchange is removed"),
+            lambda ok: self._do_delete_round(m.round_index) if ok else None,
+        )
+
+    def _do_delete_round(self, idx: int) -> None:
+        try:
+            edit.delete_round(self._path, idx)
+        except edit.TrimError as e:
+            self.notify(str(e), severity="error")
+            return
+        self._reload()
+        self.notify("Round deleted (backup written).")
+
+    def action_delete_errors(self) -> None:
+        from claudex.tui.screens.dashboard import ConfirmModal
+        self.app.push_screen(
+            ConfirmModal("Delete all API-error / refusal messages?",
+                         "removes every synthetic error turn in this session"),
+            lambda ok: self._do_delete_errors() if ok else None,
+        )
+
+    def _do_delete_errors(self) -> None:
+        n, _ = edit.delete_errors(self._path)
+        self._reload()
+        self.notify(f"Deleted {n} error message(s)." if n else "No error messages found.")
 
     def action_delete_msg(self) -> None:
         m = self._selected()
@@ -299,5 +370,91 @@ class EditTextModal(ModalScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-save":
             self.action_save()
+        else:
+            self.dismiss(None)
+
+
+class InsertModal(ModalScreen):
+    """Compose a new message to insert after the selected one."""
+
+    BINDINGS = [
+        Binding("ctrl+u", "as_user", "Insert as user", show=True),
+        Binding("ctrl+a", "as_assistant", "Insert as assistant", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, after_preview: str) -> None:
+        super().__init__()
+        self._after = after_preview
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-box"):
+            yield Static(f"[bold]Insert message[/bold]  [dim]after: {self._after[:50]}[/dim]",
+                         id="dialog-title")
+            yield TextArea("", id="edit-area")
+            yield Static("[dim]ctrl+u insert as user · ctrl+a as assistant · esc cancel[/dim]")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("As user", variant="success", id="btn-user")
+                yield Button("As assistant", id="btn-assistant")
+                yield Button("Cancel", id="btn-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#edit-area", TextArea).focus()
+
+    def _emit(self, role: str) -> None:
+        text = self.query_one("#edit-area", TextArea).text
+        self.dismiss((role, text) if text.strip() else None)
+
+    def action_as_user(self) -> None:
+        self._emit("user")
+
+    def action_as_assistant(self) -> None:
+        self._emit("assistant")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-user":
+            self._emit("user")
+        elif event.button.id == "btn-assistant":
+            self._emit("assistant")
+        else:
+            self.dismiss(None)
+
+
+class ReplaceModal(ModalScreen):
+    """Collect a find / replace pair for a whole-session substitution."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=True)]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-box"):
+            yield Static("[bold]Find / replace across the session[/bold]", id="dialog-title")
+            yield Static("[dim]Find:[/dim]")
+            yield Input(placeholder="text to find", id="find-input")
+            yield Static("[dim]Replace with:[/dim]")
+            yield Input(placeholder="replacement (empty = delete)", id="repl-input")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Replace", variant="success", id="btn-go")
+                yield Button("Cancel", id="btn-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#find-input", Input).focus()
+
+    def _emit(self) -> None:
+        find = self.query_one("#find-input", Input).value
+        repl = self.query_one("#repl-input", Input).value
+        self.dismiss((find, repl) if find else None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._emit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-go":
+            self._emit()
         else:
             self.dismiss(None)

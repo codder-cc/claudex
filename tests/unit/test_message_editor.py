@@ -165,3 +165,46 @@ async def test_history_tab_survives_duplicate_session_ids(tmp_path, monkeypatch)
         await pilot.pause()
         table = app.query_one("#session-table", DataTable)
         assert table.row_count == 2       # both rows added, no DuplicateKey crash
+
+
+async def test_editor_insert_and_replace_and_delete_round(session):
+    app = _Host(session)
+    async with app.run_test() as pilot:
+        await _settle(app, pilot)
+        screen = app.screen
+        # insert a user message after a1
+        screen._do_insert("a1", ("user", "steer it"))
+        await _settle(app, pilot)
+        assert any(m.text == "steer it" and m.role == "user" for m in screen._msgs)
+        # find/replace
+        screen._do_replace(("second question", "SECOND Q"))
+        await _settle(app, pilot)
+        assert any(m.text == "SECOND Q" for m in screen._msgs)
+        # delete round 0 (the first exchange)
+        screen._do_delete_round(0)
+        await _settle(app, pilot)
+        assert all(m.uuid != "u1" for m in screen._msgs)
+
+
+async def test_editor_delete_errors_action(tmp_path):
+    f = tmp_path / "e.jsonl"
+    rows = [
+        {"type": "user", "uuid": "u1", "parentUuid": None,
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "uuid": "e1", "parentUuid": "u1", "isApiErrorMessage": True,
+         "message": {"role": "assistant", "model": "<synthetic>",
+                     "content": [{"type": "text", "text": "API Error: safeguards"}]}},
+        {"type": "assistant", "uuid": "a1", "parentUuid": "e1",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
+    ]
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    s = Session(session_id="e", project_path=tmp_path, profile_name="t", file_path=f)
+    app = _Host(s)
+    async with app.run_test() as pilot:
+        await _settle(app, pilot)
+        app.screen.action_toggle_all()        # error only visible in 'all'
+        await _settle(app, pilot)
+        assert any(m.kind == "error" for m in app.screen._msgs)
+        app.screen._do_delete_errors()
+        await _settle(app, pilot)
+        assert all(m.kind != "error" for m in app.screen._msgs)
