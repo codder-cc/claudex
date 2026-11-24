@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -57,13 +60,22 @@ class HistoryWidget(Widget):
         self._load_sessions()
 
     def _load_sessions(self, query: str = "", profile_filter: str = "") -> None:
+        # Parsing transcripts can take a moment the first time (and the active
+        # session is re-read each open), so do it off the UI thread — the table
+        # shows "Loading…" and fills in when ready instead of freezing the app.
+        self.query_one("#session-detail", Static).update("[dim]Loading sessions…[/dim]")
+        self._fetch(query, profile_filter)
+
+    @work(exclusive=True)
+    async def _fetch(self, query: str, profile_filter: str) -> None:
         if not self._browser:
             return
         if query:
-            sessions = self._browser.search(query, profile_filter=profile_filter or None)
+            sessions = await asyncio.to_thread(
+                self._browser.search, query, profile_filter or None)
         else:
-            sessions = self._browser.get_all_sessions(
-                profile_filter=profile_filter or None, limit=200)
+            sessions = await asyncio.to_thread(
+                self._browser.get_all_sessions, profile_filter or None, 200)
         self._sessions = sessions
         table = self.query_one("#session-table", DataTable)
         table.clear()
@@ -76,6 +88,8 @@ class HistoryWidget(Widget):
                 str(s.project_path)[-35:],
                 key=f"{s.profile_name}/{s.session_id}",
             )
+        self.query_one("#session-detail", Static).update(
+            f"[dim]{len(sessions)} sessions[/dim]" if sessions else "[dim]No sessions[/dim]")
 
     def _reload_current(self) -> None:
         """Re-run the active search/filter (used after mutating actions)."""

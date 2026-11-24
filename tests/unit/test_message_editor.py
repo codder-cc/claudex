@@ -162,6 +162,7 @@ async def test_history_tab_survives_duplicate_session_ids(tmp_path, monkeypatch)
 
     app = _H()
     async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()   # the list loads in a worker now
         await pilot.pause()
         table = app.query_one("#session-table", DataTable)
         assert table.row_count == 2       # both rows added, no DuplicateKey crash

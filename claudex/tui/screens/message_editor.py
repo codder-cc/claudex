@@ -29,7 +29,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static, TextArea
 
-from claudex.history import edit
+from claudex.history import edit, msgindex
 from claudex.history.models import Session
 
 _KIND_STYLE = {
@@ -102,7 +102,7 @@ class MessageEditorScreen(Screen):
         self._update_header()
         try:
             self._msgs = await asyncio.to_thread(
-                edit.list_messages, self._path, turns=(self._mode == "turns"))
+                msgindex.list_views, self._path, turns=(self._mode == "turns"))
         except OSError as e:
             self._msgs = []
             self.notify(f"Can't read transcript: {e}", severity="error")
@@ -152,7 +152,13 @@ class MessageEditorScreen(Screen):
             body.update("")
             return
         head = f"{m.role} · {m.kind} · {m.uuid[:8]}\n{'─' * 40}\n"
-        body.update(Text(head) + Text(m.text or "(empty)"))
+        # The list carries only a preview; load the full text lazily by offset.
+        full = m.text
+        if m.offset >= 0:
+            _, text, _ = edit.read_message(self._path, m.offset)
+            if text:
+                full = text
+        body.update(Text(head) + Text(full or "(empty)"))
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         self._show_selected()
@@ -177,6 +183,11 @@ class MessageEditorScreen(Screen):
         self.notify("Showing every entry." if self._mode == "all"
                     else "Showing the conversation (turns).")
 
+    def _reload_edited(self) -> None:
+        # An in-place edit isn't a pure append, so drop the cached index first.
+        msgindex.invalidate(self._path)
+        self._reload()
+
     # ── edits ───────────────────────────────────────────────────────────────────
     def action_edit_msg(self) -> None:
         m = self._selected()
@@ -185,9 +196,12 @@ class MessageEditorScreen(Screen):
         if not m.editable:
             self.notify(f"{m.kind} messages aren't editable", severity="warning")
             return
+        payload = m.edit_text
+        if m.offset >= 0:                       # load the real payload lazily
+            _, _, payload = edit.read_message(self._path, m.offset)
         hint = "  (JSON tool input)" if m.kind == "tool_use" else ""
         self.app.push_screen(
-            EditTextModal(m.edit_text, f"{m.role} · {m.kind} · {m.uuid[:8]}{hint}"),
+            EditTextModal(payload, f"{m.role} · {m.kind} · {m.uuid[:8]}{hint}"),
             lambda new: self._do_edit(m.uuid, new) if new is not None else None,
         )
 
@@ -197,7 +211,7 @@ class MessageEditorScreen(Screen):
         except edit.TrimError as e:
             self.notify(str(e), severity="error")
             return
-        self._reload()
+        self._reload_edited()
         self.notify("Message edited (backup written).")
 
     def action_insert_msg(self) -> None:
@@ -216,7 +230,7 @@ class MessageEditorScreen(Screen):
         except edit.TrimError as e:
             self.notify(str(e), severity="error")
             return
-        self._reload()
+        self._reload_edited()
         self.notify(f"Inserted a {role} message (backup written).")
 
     def action_replace(self) -> None:
@@ -230,7 +244,7 @@ class MessageEditorScreen(Screen):
         except edit.TrimError as e:
             self.notify(str(e), severity="error")
             return
-        self._reload()
+        self._reload_edited()
         self.notify(f"Replaced in {n} message(s) (backup written).")
 
     def action_delete_round(self) -> None:
@@ -250,7 +264,7 @@ class MessageEditorScreen(Screen):
         except edit.TrimError as e:
             self.notify(str(e), severity="error")
             return
-        self._reload()
+        self._reload_edited()
         self.notify("Round deleted (backup written).")
 
     def action_delete_errors(self) -> None:
@@ -263,7 +277,7 @@ class MessageEditorScreen(Screen):
 
     def _do_delete_errors(self) -> None:
         n, _ = edit.delete_errors(self._path)
-        self._reload()
+        self._reload_edited()
         self.notify(f"Deleted {n} error message(s)." if n else "No error messages found.")
 
     def action_delete_msg(self) -> None:
@@ -285,7 +299,7 @@ class MessageEditorScreen(Screen):
         except edit.TrimError as e:
             self.notify(str(e), severity="error")
             return
-        self._reload()
+        self._reload_edited()
         self.notify("Message deleted (backup written).")
 
     def action_trim_here(self) -> None:
@@ -305,7 +319,7 @@ class MessageEditorScreen(Screen):
         except edit.TrimError as e:
             self.notify(str(e), severity="error")
             return
-        self._reload()
+        self._reload_edited()
         self.notify("Trimmed." if bak else "Already the last message — nothing to trim.")
 
     # ── live follow ─────────────────────────────────────────────────────────────

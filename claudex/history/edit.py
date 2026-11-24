@@ -185,27 +185,43 @@ class _Scan:
     kind: dict           # message uuid → text|thinking|tool_use|tool_result|command|meta
     text: dict           # message uuid → full text (or a label for non-text kinds)
     edit: dict           # message uuid → editable payload, for tool kinds only
+    offset: dict         # message uuid → byte offset of its line (for lazy reads)
     turn: set            # message uuids that are genuine human turns
     sidechain: set       # message uuids on subagent sidechains
     leaf: Optional[str]  # last non-sidechain message in file order
     order: List[str]     # message uuids in file order
+    scanned: int = 0     # byte offset through complete lines (for incremental)
 
 
-def _scan(path: Path) -> _Scan:
-    s = _Scan(parent_of={}, role={}, kind={}, text={}, edit={}, turn=set(),
-              sidechain=set(), leaf=None, order=[])
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if not line.strip():
+def _scan(path: Path, start_offset: int = 0) -> _Scan:
+    """Single binary pass over (part of) a transcript, recording byte offsets so
+    the editor index can be cached and grown incrementally."""
+    s = _Scan(parent_of={}, role={}, kind={}, text={}, edit={}, offset={},
+              turn=set(), sidechain=set(), leaf=None, order=[], scanned=start_offset)
+    pos = start_offset
+    with open(path, "rb") as fb:
+        fb.seek(start_offset)
+        for raw in fb:
+            start = pos
+            pos += len(raw)
+            terminated = raw.endswith(b"\n")
+            if terminated:
+                s.scanned = pos
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
                 continue
             try:
                 obj = json.loads(line)
             except (json.JSONDecodeError, ValueError):
+                if not terminated:
+                    break
                 continue
             if not isinstance(obj, dict):
                 continue
             u = obj.get("uuid")
             if not u:
+                if not terminated:
+                    break
                 continue
             s.parent_of[u] = obj.get("parentUuid")
             if obj.get("type") in _MSG_TYPES:
@@ -213,6 +229,7 @@ def _scan(path: Path) -> _Scan:
                 kind = _entry_kind(obj)
                 s.kind[u] = kind
                 s.text[u] = _entry_full_text(obj)
+                s.offset[u] = start
                 if kind in ("tool_result", "tool_use"):
                     s.edit[u] = _edit_payload(obj, kind)
                 if is_user_turn(obj):
@@ -393,6 +410,7 @@ class MsgView:
     editable: bool             # True when the edit box can open this message
     on_active_chain: bool      # False for dead branches / sidechains
     edit_text: str = ""        # exactly what the edit box should show
+    offset: int = -1           # byte offset of this message's line (lazy reads)
 
     @property
     def preview(self) -> str:
@@ -861,6 +879,24 @@ def replace_text(path: Path, find: str, repl: str, *, regex: bool = False,
             pass
         tmp.replace(path)
     return changed
+
+
+def read_message(path: Path, offset: int) -> tuple:
+    """Read one message line at *offset* and return (kind, full_text, edit_text).
+    Used by the editor to load a message's content lazily, by byte offset."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            raw = f.readline()
+        obj = json.loads(raw.decode("utf-8", "replace"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "", "", ""
+    if not isinstance(obj, dict):
+        return "", "", ""
+    kind = _entry_kind(obj)
+    full = _entry_full_text(obj)
+    edit = _edit_payload(obj, kind) if kind in ("tool_result", "tool_use") else full
+    return kind, full, edit
 
 
 def read_since(path: Path, offset: int) -> tuple[List[dict], int]:
