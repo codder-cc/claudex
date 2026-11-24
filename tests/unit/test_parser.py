@@ -63,3 +63,53 @@ def test_decode_project_path_url():
 def test_decode_project_path_dash():
     result = decode_project_path("-home-user-dev-myapp")
     assert "home" in str(result)
+
+
+# ── metadata cache + incremental parse ────────────────────────────────────────
+def _write_lines(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_iter_sessions_cache_warm_is_consistent(tmp_path):
+    from claudex.history.parser import iter_sessions
+    from claudex.history.cache import cache_path
+    proj = tmp_path / "projects" / "-home-u-proj"
+    proj.mkdir(parents=True)
+    f = proj / "11111111-0000-4000-8000-000000000001.jsonl"
+    _write_lines(f, [
+        {"role": "user", "content": "hello", "timestamp": "2026-03-20T10:00:00"},
+        {"role": "assistant", "content": "hi", "usage": {"input_tokens": 10, "output_tokens": 5},
+         "timestamp": "2026-03-20T10:00:01"},
+    ])
+    cold = list(iter_sessions(tmp_path, "p"))
+    assert len(cold) == 1 and cold[0].message_count == 2
+    assert cache_path(tmp_path).exists()
+    warm = list(iter_sessions(tmp_path, "p"))
+    assert len(warm) == 1 and warm[0].message_count == 2
+    assert warm[0].title == "hello"
+    assert warm[0].total_tokens.input_tokens == 10
+
+
+def test_iter_sessions_incremental_on_growth(tmp_path):
+    from claudex.history.parser import iter_sessions
+    proj = tmp_path / "projects" / "-home-u-proj"
+    proj.mkdir(parents=True)
+    f = proj / "22222222-0000-4000-8000-000000000002.jsonl"
+    _write_lines(f, [
+        {"role": "user", "content": "start", "timestamp": "2026-03-20T10:00:00"},
+        {"role": "assistant", "content": "ok", "usage": {"input_tokens": 10, "output_tokens": 5},
+         "timestamp": "2026-03-20T10:00:01"},
+    ])
+    first = list(iter_sessions(tmp_path, "p"))[0]
+    assert first.message_count == 2
+    # append two more complete lines (the live session grew)
+    with open(f, "a") as fh:
+        fh.write(json.dumps({"role": "user", "content": "more",
+                             "timestamp": "2026-03-20T10:05:00"}) + "\n")
+        fh.write(json.dumps({"role": "assistant", "content": "sure",
+                             "usage": {"input_tokens": 7, "output_tokens": 3},
+                             "timestamp": "2026-03-20T10:05:01"}) + "\n")
+    second = list(iter_sessions(tmp_path, "p"))[0]
+    assert second.message_count == 4                 # incrementally added, not reset
+    assert second.total_tokens.input_tokens == 17    # 10 + 7 accumulated
+    assert second.title == "start"                   # title unchanged
