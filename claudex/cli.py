@@ -996,6 +996,112 @@ def session_migrate(session_id: str, from_profile: str, to_profile: str, keep_th
     console.print(f"  New path: {new_session.file_path}")
 
 
+def _find_session(session_id: str, profile: Optional[str]):
+    """Resolve a session by exact id or unique prefix. Exits on miss/ambiguity."""
+    pm = _pm()
+    from claudex.history.browser import HistoryBrowser
+    try:
+        browser = HistoryBrowser(pm.list())
+    except ClaudexError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+    candidates = [s for s in browser.get_all_sessions(profile_filter=profile)
+                  if s.session_id == session_id or s.session_id.startswith(session_id)]
+    exact = [s for s in candidates if s.session_id == session_id]
+    candidates = exact or candidates
+    if not candidates:
+        where = f" in profile '{profile}'" if profile else ""
+        console.print(f"[red]Session '{session_id}' not found{where}.[/red]")
+        console.print("  Browse with [cyan]claudex session list[/cyan].")
+        sys.exit(1)
+    if len(candidates) > 1:
+        console.print(f"[red]Ambiguous session id '{session_id}'[/red] — matches "
+                      f"{len(candidates)}. Use a longer id or --profile.")
+        sys.exit(1)
+    return candidates[0]
+
+
+@session_group.command("rounds")
+@click.argument("session_id")
+@click.option("--profile", "-p", default=None, help="Limit the search to one profile")
+@click.option("--limit", "-n", default=0, help="Show only the last N rounds (0 = all)")
+def session_rounds(session_id: str, profile: Optional[str], limit: int) -> None:
+    """Preview a session's conversational rounds (newest last), numbered.
+
+    A round is one message you sent plus the assistant's full reply. Use the
+    counts here to choose N for [cyan]claudex session trim[/cyan].
+    """
+    from claudex.history import edit
+    session = _find_session(session_id, profile)
+    rounds = edit.list_rounds(session.file_path)
+    if not rounds:
+        console.print("[yellow]No conversational rounds in this session.[/yellow]")
+        return
+    shown = rounds[-limit:] if limit else rounds
+    table = Table(title=f"Rounds — {session.session_id[:16]}…  ({len(rounds)} total)",
+                  header_style="bold cyan")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("from end", justify="right", style="dim")
+    table.add_column("lines", justify="right")
+    table.add_column("you said")
+    table.add_column("assistant replied", style="dim")
+    for r in shown:
+        from_end = len(rounds) - r.index
+        table.add_row(str(r.index + 1), f"-{from_end - 1}" if from_end > 1 else "last",
+                      str(r.line_count), r.user_text[:50] or "(no text)",
+                      r.assistant_text[:45])
+    console.print(table)
+    console.print(f"[dim]Trim the last k: [cyan]claudex session trim "
+                  f"{session.session_id[:12]} --last k[/cyan][/dim]")
+
+
+@session_group.command("trim")
+@click.argument("session_id")
+@click.option("--last", "-n", "last", required=True, type=int,
+              help="Drop the last N conversational rounds")
+@click.option("--profile", "-p", default=None, help="Limit the search to one profile")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed, change nothing")
+@click.option("--no-backup", is_flag=True, help="Don't write a .bak copy (default: back up)")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt")
+def session_trim(session_id: str, last: int, profile: Optional[str],
+                 dry_run: bool, no_backup: bool, yes: bool) -> None:
+    """Delete the last N rounds from a saved session transcript.
+
+    Trims whole rounds (your message + the assistant's reply) off the tail, so
+    the result stays resumable — no half-finished tool call is left behind. A
+    timestamped .bak copy is written first unless --no-backup is given.
+    """
+    from claudex.history import edit
+    session = _find_session(session_id, profile)
+    try:
+        plan = edit.plan_trim_rounds(session.file_path, last)
+    except edit.TrimError as e:
+        console.print(f"[red]Can't trim:[/red] {e}")
+        sys.exit(1)
+
+    console.print(f"Session [bold]{session.session_id[:16]}…[/bold] "
+                  f"(profile [bold]{session.profile_name}[/bold])")
+    console.print(f"  rounds: {plan.rounds_total} → [bold]{plan.rounds_kept}[/bold] "
+                  f"(removing {plan.rounds_removed})")
+    console.print(f"  lines:  {plan.lines_before} → {plan.lines_after} "
+                  f"(−{plan.lines_before - plan.lines_after})")
+    for r in plan.removed_rounds:
+        console.print(f"    [red]− round {r.index + 1}[/red]: {r.user_text[:60] or '(no text)'}")
+
+    if dry_run:
+        console.print("[dim]Dry run — nothing written.[/dim]")
+        return
+    if not yes:
+        if not click.confirm("Apply this trim?", default=False):
+            console.print("[yellow]Aborted.[/yellow]")
+            return
+    bak = edit.apply_trim(session.file_path, plan, backup=not no_backup)
+    console.print(f"[green]✓[/green] Trimmed {plan.rounds_removed} round(s).")
+    if bak:
+        console.print(f"  Backup: {bak}")
+    console.print(f"  Resume: [cyan]claudex session resume -id {session.session_id}[/cyan]")
+
+
 # ─── History command ───────────────────────────────────────────────────────────
 
 @cli.command("history")
