@@ -181,3 +181,159 @@ def test_hook_already_on_target_blocks(env):
     )
     assert "Already on" in json.loads(out)["reason"]
     assert not req_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Routing: a /switch reaches only the supervisor hosting its claude
+# ---------------------------------------------------------------------------
+
+def _switch_stdin(target="mystic"):
+    return json.dumps({"prompt": f"/switch {target}", "session_id": "s", "cwd": "/c"})
+
+
+def test_hook_routes_to_own_supervisor_only(env, monkeypatch):
+    """Two tabs under `claudex run`: /switch in one must not touch the other
+    (the bug that killed every supervised tab on a single switch)."""
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    pm.create("mystic")
+    from claudex.constants import ENV_SUPERVISOR
+    from claudex.core.supervisor import (
+        Liveness, handle_switch_hook, liveness_path, request_path_for,
+    )
+    mine, other = os.getpid(), os.getppid()  # both alive
+    Liveness(pid=mine, profile="incr").write(liveness_path(mine))
+    Liveness(pid=other, profile="incr").write(liveness_path(other))
+    monkeypatch.setenv(ENV_SUPERVISOR, str(mine))
+
+    out, _ = handle_switch_hook(_switch_stdin(), pm=pm)
+    assert "Switching" in json.loads(out)["reason"]
+    assert request_path_for(mine).exists()
+    assert not request_path_for(other).exists()
+
+
+def test_hook_without_supervisor_blocks_and_writes_nothing(env, monkeypatch):
+    """A claude started without `claudex run` (the hook sits in the profile's
+    shared settings.json) is told so; running supervisors are left alone."""
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    pm.create("mystic")
+    from claudex.constants import ENV_SUPERVISOR
+    from claudex.core.supervisor import Liveness, handle_switch_hook, liveness_path
+    Liveness(pid=os.getppid(), profile="incr").write(liveness_path(os.getppid()))
+    monkeypatch.delenv(ENV_SUPERVISOR, raising=False)
+
+    out, _ = handle_switch_hook(_switch_stdin(), pm=pm)
+    assert "needs a claudex supervisor" in json.loads(out)["reason"]
+    assert not list((tmp_path / "supervisors").glob("*.request.json"))
+
+
+def test_hook_ignores_dead_supervisor(env, monkeypatch):
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    pm.create("mystic")
+    from claudex.constants import ENV_SUPERVISOR
+    from claudex.core.supervisor import (
+        Liveness, handle_switch_hook, liveness_path, request_path_for,
+    )
+    dead = 2_000_000_000  # no such pid
+    Liveness(pid=dead, profile="incr").write(liveness_path(dead))
+    monkeypatch.setenv(ENV_SUPERVISOR, str(dead))
+
+    out, _ = handle_switch_hook(_switch_stdin(), pm=pm)
+    assert "needs a claudex supervisor" in json.loads(out)["reason"]
+    assert not request_path_for(dead).exists()
+    assert not liveness_path(dead).exists()  # pruned
+
+
+def test_child_env_carries_supervisor_pid(env, monkeypatch):
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    from claudex.constants import ENV_SUPERVISOR
+    from claudex.core.supervisor import Supervisor
+    sup = Supervisor("incr", pm=pm, proxy_override=False, install_hook=False)
+    env_ = sup._env_for(str(pm.get("incr").config_dir), "incr")
+    assert env_[ENV_SUPERVISOR] == str(os.getpid())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="execvpe launch path")
+def test_unsupervised_launch_drops_inherited_supervisor_pid(monkeypatch):
+    from claudex.constants import ENV_SUPERVISOR
+    from claudex.core.session import SessionManager
+    seen = {}
+    monkeypatch.setattr("claudex.core.session.os.execvpe",
+                        lambda cmd0, cmd, env: seen.update(env=env))
+    SessionManager.__new__(SessionManager)._launch(["claude"], {ENV_SUPERVISOR: "123", "A": "1"})
+    assert seen["env"] == {"A": "1"}
+
+
+# ---------------------------------------------------------------------------
+# Hook lifecycle: shared settings.json, several supervisors
+# ---------------------------------------------------------------------------
+
+def test_shared_hook_stays_until_last_supervisor_exits(env):
+    """The first tab to exit must not pull the hook from under a tab still
+    running on the same profile; the last one out removes it."""
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    cfg = pm.get("incr").config_dir
+    from claudex.core.supervisor import HOOK_COMMAND, Liveness, Supervisor, liveness_path
+    sup = Supervisor("incr", pm=pm)
+    sup._ensure_hook(cfg)
+    sup._write_liveness()
+    assert str(cfg) in Liveness.read(liveness_path(os.getpid())).hooks
+
+    other = os.getppid()
+    Liveness(pid=other, profile="incr", hooks=[str(cfg)]).write(liveness_path(other))
+    sup._restore_hooks()
+    assert HOOK_COMMAND in (cfg / "settings.json").read_text()
+
+    # a supervisor finding the hook another live one owns shares it
+    sup._ensure_hook(cfg)
+    assert cfg in sup._hooked_dirs
+    liveness_path(other).unlink()  # the other tab exited
+    sup._restore_hooks()
+    assert HOOK_COMMAND not in (cfg / "settings.json").read_text()
+
+
+def test_user_installed_hook_is_not_claimed(env):
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    cfg = pm.get("incr").config_dir
+    from claudex.core.supervisor import HOOK_COMMAND, Supervisor, ensure_hook
+    assert ensure_hook(cfg)  # installed by hand, no supervisor around
+    sup = Supervisor("incr", pm=pm)
+    sup._ensure_hook(cfg)
+    sup._restore_hooks()
+    assert HOOK_COMMAND in (cfg / "settings.json").read_text()
+
+
+def test_restore_hook_keeps_changes_made_while_installed(env):
+    """claude writes settings.json while the hook is in (e.g. effort level);
+    removing the hook must keep that. A legacy pre-hook backup is ignored."""
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    cfg = pm.get("incr").config_dir
+    settings = cfg / "settings.json"
+    settings.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    (cfg / "settings.json.claudex-switch-bak").write_text('{"theme": "dark"}', encoding="utf-8")
+    from claudex.core.supervisor import ensure_hook, restore_hook
+    ensure_hook(cfg)
+    data = json.loads(settings.read_text())
+    data["modelSettings"] = {"opus": {"effortLevel": "xhigh"}}
+    settings.write_text(json.dumps(data), encoding="utf-8")
+
+    restore_hook(cfg)
+    assert json.loads(settings.read_text()) == {
+        "theme": "dark", "modelSettings": {"opus": {"effortLevel": "xhigh"}},
+    }
+
+
+def test_ensure_hook_leaves_unreadable_settings_alone(env):
+    tmp_path, pm, seed = env
+    pm.create("incr")
+    cfg = pm.get("incr").config_dir
+    (cfg / "settings.json").write_text("{broken", encoding="utf-8")
+    from claudex.core.supervisor import ensure_hook
+    assert ensure_hook(cfg) is False
+    assert (cfg / "settings.json").read_text() == "{broken"

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDE_BIN
+from claudex.constants import CLAUDE_CONFIG_DIR_ENV, CLAUDE_BIN, ENV_SUPERVISOR
 from claudex.core.auth import AuthManager
 from claudex.exceptions import ClaudeNotFoundError, SessionNotFoundError
 from claudex.history.browser import HistoryBrowser
@@ -98,6 +98,9 @@ class SessionManager:
         return self._history.migrate_session(session, to_profile_name, to_config_dir, strip=strip)
 
     def _launch(self, cmd: list[str], env: dict) -> None:
+        # Unsupervised: a supervisor pid inherited from a `claudex run` session
+        # this was started from would route this claude's /switch to it.
+        env.pop(ENV_SUPERVISOR, None)
         if sys.platform != "win32":
             os.execvpe(cmd[0], cmd, env)  # Replace current process (Unix)
         else:

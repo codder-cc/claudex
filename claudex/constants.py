@@ -18,6 +18,9 @@ CURRENT_ENV_PWSH = CLAUDEX_HOME / ".current_env.ps1"   # PowerShell: $env:VAR = 
 # Claude Code env var
 CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 
+# Pid of the `claudex run` supervisor, exported only to the claude it hosts
+ENV_SUPERVISOR = "CLAUDEX_SUPERVISOR"
+
 # Credential storage
 CREDENTIAL_SERVICE = "claudex"
 

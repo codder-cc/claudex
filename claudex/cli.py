@@ -1385,7 +1385,7 @@ def internal_restore_hook(name: str) -> None:
     try:
         pm = _pm()
         restore_hook(pm.get(name).config_dir)
-        console.print(f"[green]✓[/green] Hook restored/removed for '{name}'.")
+        console.print(f"[green]✓[/green] Hook removed for '{name}'.")
     except ClaudexError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
@@ -1401,7 +1401,7 @@ def internal_restore_hook(name: str) -> None:
               help="Dry-run only: seconds to wait for a /switch before giving up.")
 @click.option("--install-hook/--no-install-hook", default=True,
               help="Install the /switch hook into each profile's settings.json "
-                   "(restored on exit). On by default.")
+                   "(removed on exit once no other `claudex run` needs it). On by default.")
 @click.option("--proxy/--no-proxy", "proxy", default=None,
               help="Force proxy mode on/off for this run, overriding the "
                    "profile's stored `policy proxy` setting.")

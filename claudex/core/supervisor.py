@@ -15,6 +15,13 @@ Flow (Phase 1, when dry_run=False):
     -> Supervisor (parent of claude) sees the request, terminates the child,
        carries the transcript into the target profile, relaunches
        ``claude --resume <sid>`` with CLAUDE_CONFIG_DIR=<target>.
+
+Several supervisors run at once (one per terminal tab), and the hook lives in
+the profile's shared settings.json, so it fires in every session of that
+profile. Each supervisor therefore has its own liveness and request file under
+``~/.claudex/supervisors/``, and the hook hands a /switch only to the
+supervisor whose pid its claude inherited (:data:`ENV_SUPERVISOR`). A session
+without one is told so, and no other tab is touched.
 """
 
 from __future__ import annotations
@@ -25,11 +32,12 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from claudex.constants import CLAUDE_BIN, CLAUDE_CONFIG_DIR_ENV, CLAUDEX_HOME
+import claudex.constants as C
+from claudex.constants import CLAUDE_BIN, CLAUDE_CONFIG_DIR_ENV, ENV_SUPERVISOR
 from claudex.core.profile import ProfileManager, validate_profile_name
 from claudex.core.switch import (
     SwitchRequest,
@@ -40,13 +48,22 @@ from claudex.core.switch import (
 )
 from claudex.exceptions import ProfileNotFoundError
 
-SUPERVISOR_FILE = CLAUDEX_HOME / ".supervisor"
-SWITCH_REQUEST_FILE = CLAUDEX_HOME / ".switch_request"
-
 # Env the supervisor exports into its claude child so the hook knows the live
-# context without re-reading on-disk state that may lag.
-ENV_SUPERVISOR = "CLAUDEX_SUPERVISOR"
+# context without re-reading on-disk state that may lag. ENV_SUPERVISOR (from
+# claudex.constants) carries the supervisor's pid.
 ENV_ACTIVE_PROFILE = "CLAUDEX_ACTIVE_PROFILE"
+
+
+def _supervisors_dir() -> Path:
+    return C.CLAUDEX_HOME / "supervisors"
+
+
+def liveness_path(pid: int) -> Path:
+    return _supervisors_dir() / f"{pid}.json"
+
+
+def request_path_for(pid: int) -> Path:
+    return _supervisors_dir() / f"{pid}.request.json"
 
 
 # ---------------------------------------------------------------------------
@@ -70,20 +87,28 @@ class Liveness:
     pid: int
     profile: str
     model: int = 1
+    # config dirs whose /switch hook this supervisor relies on
+    hooks: list[str] = field(default_factory=list)
+    # a dry-run supervisor hosts no claude: it takes /switch from any session
+    # that has no supervisor of its own
+    dry_run: bool = False
 
     def to_json(self) -> str:
-        return json.dumps({"pid": self.pid, "profile": self.profile, "model": self.model})
+        return json.dumps({"pid": self.pid, "profile": self.profile, "model": self.model,
+                           "hooks": self.hooks, "dry_run": self.dry_run})
 
     @classmethod
-    def read(cls, path: Path = SUPERVISOR_FILE) -> Optional["Liveness"]:
+    def read(cls, path: Path) -> Optional["Liveness"]:
         try:
             d = json.loads(path.read_text(encoding="utf-8"))
             return cls(pid=int(d["pid"]), profile=str(d.get("profile", "")),
-                       model=int(d.get("model", 1)))
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                       model=int(d.get("model", 1)),
+                       hooks=[str(h) for h in d.get("hooks") or []],
+                       dry_run=bool(d.get("dry_run", False)))
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
 
-    def write(self, path: Path = SUPERVISOR_FILE) -> None:
+    def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.to_json(), encoding="utf-8")
         try:
@@ -92,9 +117,49 @@ class Liveness:
             pass
 
 
-def supervisor_alive(path: Path = SUPERVISOR_FILE) -> bool:
+def supervisor_alive(path: Path) -> bool:
     live = Liveness.read(path)
     return bool(live and is_pid_alive(live.pid))
+
+
+def live_supervisors(exclude: Optional[int] = None) -> dict[int, Liveness]:
+    """pid -> liveness of every supervisor still running. Files of dead ones
+    (killed before they could clean up) are pruned with their requests."""
+    live: dict[int, Liveness] = {}
+    try:
+        paths = list(_supervisors_dir().glob("*.json"))
+    except OSError:
+        return live
+    for path in paths:
+        if not path.stem.isdigit():
+            continue  # a request file
+        pid = int(path.stem)
+        if not is_pid_alive(pid):
+            for stale in (path, request_path_for(pid)):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            continue
+        record = Liveness.read(path)
+        if record is not None and pid != exclude:
+            live[pid] = record
+    return live
+
+
+def find_supervisor() -> Optional[int]:
+    """Pid of the supervisor hosting the claude this hook runs for: the one
+    its environment names, else a dry-run supervisor, else None."""
+    live = live_supervisors()
+    env = os.environ.get(ENV_SUPERVISOR, "")
+    if env.isdigit() and int(env) in live:
+        return int(env)
+    return next((pid for pid, rec in live.items() if rec.dry_run), None)
+
+
+def hooks_in_use(exclude: Optional[int] = None) -> set[str]:
+    """Config dirs whose /switch hook some live supervisor relies on."""
+    return {h for rec in live_supervisors(exclude).values() for h in rec.hooks}
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +167,6 @@ def supervisor_alive(path: Path = SUPERVISOR_FILE) -> bool:
 # ---------------------------------------------------------------------------
 
 HOOK_COMMAND = "claudex _internal switch-request"
-_HOOK_BACKUP_SUFFIX = ".claudex-switch-bak"
 
 
 def _hook_entry() -> dict:
@@ -121,9 +185,9 @@ def _has_our_hook(settings: dict) -> bool:
 def ensure_hook(config_dir: Path) -> bool:
     """Idempotently add the /switch hook to ``config_dir/settings.json``.
 
-    Backs up the original to ``settings.json.claudex-switch-bak`` (once) before
-    the first modification. Returns True if a change was written. Preserves any
-    existing user hooks. Touches no credentials.
+    Returns True if a change was written. Preserves any existing user hooks;
+    a settings.json that cannot be parsed is the user's and is left alone
+    (no hook). Touches no credentials.
     """
     settings_path = config_dir / "settings.json"
     settings: dict = {}
@@ -131,15 +195,11 @@ def ensure_hook(config_dir: Path) -> bool:
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8")) or {}
         except (OSError, ValueError, json.JSONDecodeError):
-            settings = {}
+            return False
     if not isinstance(settings, dict):
-        settings = {}
+        return False
     if _has_our_hook(settings):
         return False
-
-    backup = config_dir / f"settings.json{_HOOK_BACKUP_SUFFIX}"
-    if settings_path.exists() and not backup.exists():
-        backup.write_bytes(settings_path.read_bytes())
 
     hooks = settings.setdefault("hooks", {})
     ups = hooks.setdefault("UserPromptSubmit", [])
@@ -150,23 +210,18 @@ def ensure_hook(config_dir: Path) -> bool:
 
 
 def restore_hook(config_dir: Path) -> None:
-    """Undo :func:`ensure_hook`: restore the backup if present, else strip only
-    our hook entry (leaving any user hooks intact)."""
+    """Undo :func:`ensure_hook`: strip only our hook entry, leaving the rest of
+    settings.json as it is NOW. Never restore a pre-hook snapshot: claude and
+    the user keep writing the file while the hook is installed (model and
+    effort settings, permissions), and a snapshot would silently undo that."""
     settings_path = config_dir / "settings.json"
-    backup = config_dir / f"settings.json{_HOOK_BACKUP_SUFFIX}"
-    if backup.exists():
-        settings_path.write_bytes(backup.read_bytes())
-        try:
-            backup.unlink()
-        except OSError:
-            pass
-        return
-    # No backup → there was no settings.json before, or we never backed up.
     if not settings_path.exists():
         return
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8")) or {}
     except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(settings, dict):
         return
     groups = (settings.get("hooks") or {}).get("UserPromptSubmit")
     if not groups:
@@ -174,6 +229,8 @@ def restore_hook(config_dir: Path) -> None:
     kept = [g for g in groups if not any(
         h.get("command") == HOOK_COMMAND for h in (g.get("hooks") or [])
     )]
+    if len(kept) == len(groups):
+        return
     if kept:
         settings["hooks"]["UserPromptSubmit"] = kept
     else:
@@ -216,14 +273,16 @@ def _block(reason: str) -> str:
 def handle_switch_hook(
     stdin_text: str,
     pm: Optional[ProfileManager] = None,
-    request_path: Path = SWITCH_REQUEST_FILE,
-    supervisor_file: Path = SUPERVISOR_FILE,
+    request_path: Optional[Path] = None,
+    supervisor_file: Optional[Path] = None,
 ) -> tuple[str, int]:
     """Pure-ish hook handler. Returns ``(stdout_text, exit_code)``.
 
     * Non-``/switch`` prompt -> ``("", 0)`` passthrough (hook stays invisible).
-    * ``/switch`` -> writes a SwitchRequest and returns a block decision, or a
-      block explaining why it can't (no supervisor / unknown profile / etc.).
+    * ``/switch`` -> writes a SwitchRequest for the supervisor hosting this
+      claude (:func:`find_supervisor`; explicit paths override) and returns a
+      block decision, or a block explaining why it can't (no supervisor /
+      unknown profile / etc.).
 
     Writes nothing anywhere except the request file, and only on a valid switch.
     """
@@ -240,7 +299,10 @@ def handle_switch_hook(
         return ("", 0)  # not a switch command
 
     # From here on it IS a /switch — we always block the prompt.
-    live = Liveness.read(supervisor_file)
+    if supervisor_file is None:
+        pid = find_supervisor()
+        supervisor_file = liveness_path(pid) if pid is not None else None
+    live = Liveness.read(supervisor_file) if supervisor_file is not None else None
     if not live or not is_pid_alive(live.pid):
         return (_block("⚠️  switch needs a claudex supervisor — start your "
                        "session with `claudex run <profile>`."), 0)
@@ -264,7 +326,7 @@ def handle_switch_hook(
         source_profile=live.profile,
         model=live.model,
     )
-    req.write(request_path)
+    req.write(request_path or request_path_for(live.pid))
     return (_block(f"🔄 Switching to '{name}'… the supervisor will reopen this "
                    f"conversation under that profile."), 0)
 
@@ -304,8 +366,8 @@ class Supervisor:
         extra_args: Optional[list[str]] = None,
         poll_seconds: float = 0.5,
         pm: Optional[ProfileManager] = None,
-        request_path: Path = SWITCH_REQUEST_FILE,
-        supervisor_file: Path = SUPERVISOR_FILE,
+        request_path: Optional[Path] = None,
+        supervisor_file: Optional[Path] = None,
         claude_bin: str = CLAUDE_BIN,
         install_hook: bool = True,
         proxy_override: Optional[bool] = None,
@@ -320,11 +382,14 @@ class Supervisor:
         self.dry_run = dry_run
         self.extra_args = list(extra_args or [])
         self.poll_seconds = poll_seconds
-        self.request_path = request_path
-        self.supervisor_file = supervisor_file
+        self.request_path = request_path or request_path_for(os.getpid())
+        self.supervisor_file = supervisor_file or liveness_path(os.getpid())
         self.claude_bin = claude_bin
         self.install_hook = install_hook
+        # config dirs whose hook this supervisor relies on and removes on exit
+        # (unless another live supervisor still relies on it)
         self._hooked_dirs: set[Path] = set()
+        self._dry_run = False
         self._child: Optional[subprocess.Popen] = None
         self._shutdown = False
         # Seconds to wait for claude's graceful SIGTERM shutdown before SIGKILL.
@@ -334,8 +399,9 @@ class Supervisor:
 
     # -- liveness --------------------------------------------------------
     def _write_liveness(self) -> None:
-        Liveness(pid=os.getpid(), profile=self.active_profile,
-                 model=self.model).write(self.supervisor_file)
+        Liveness(pid=os.getpid(), profile=self.active_profile, model=self.model,
+                 hooks=sorted(str(d) for d in self._hooked_dirs),
+                 dry_run=self._dry_run).write(self.supervisor_file)
 
     def _clear_liveness(self) -> None:
         try:
@@ -344,6 +410,10 @@ class Supervisor:
                 # Only clear if it's ours — don't nuke another supervisor's file.
                 if cur and cur.pid == os.getpid():
                     self.supervisor_file.unlink()
+        except OSError:
+            pass
+        try:
+            self.request_path.unlink()  # one that landed after claude exited
         except OSError:
             pass
 
@@ -415,16 +485,22 @@ class Supervisor:
         if not self.install_hook:
             return
         try:
-            if ensure_hook(config_dir):
-                self._hooked_dirs.add(config_dir)
-            else:
-                # Already had it (user-installed); don't claim ownership.
-                pass
+            added = ensure_hook(config_dir)
         except OSError:
-            pass
+            return
+        # Already there: another live supervisor's (share it, so the last one
+        # out removes it) or user-installed (don't claim ownership).
+        if added or str(config_dir) in hooks_in_use(exclude=os.getpid()):
+            self._hooked_dirs.add(config_dir)
 
     def _restore_hooks(self) -> None:
+        """Remove our hook from every dir we hooked, except those another live
+        supervisor still relies on: the hook lives in the profile's shared
+        settings.json, and pulling it would break /switch in that tab."""
+        in_use = hooks_in_use(exclude=os.getpid())
         for d in list(self._hooked_dirs):
+            if str(d) in in_use:
+                continue
             try:
                 restore_hook(d)
             except OSError:
@@ -447,7 +523,7 @@ class Supervisor:
     def _env_for(self, config_dir: str, profile: str) -> dict:
         env = {**os.environ,
                CLAUDE_CONFIG_DIR_ENV: config_dir,
-               ENV_SUPERVISOR: "1",
+               ENV_SUPERVISOR: str(os.getpid()),
                ENV_ACTIVE_PROFILE: profile}
         # Apply the profile's remote-settings policy (no-op unless set). Touches
         # no credentials — only NODE_OPTIONS, the shim, and the profile's own
@@ -592,8 +668,10 @@ class Supervisor:
         launch plan, and return it WITHOUT spawning or killing anything.
 
         Returns the PlannedLaunch (also when a request is already pending), or
-        None if *timeout* elapsed with no request.
+        None if *timeout* elapsed with no request. Hosting no claude, it takes
+        the /switch of any session that has no supervisor of its own.
         """
+        self._dry_run = True
         self._write_liveness()
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
